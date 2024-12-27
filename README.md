@@ -1,40 +1,44 @@
 # VozSync
 
-Este projeto é dividido em duas partes: uma roda na máquina do usuário e a outra pode rodar na nuvem ou localmente. O usuário pode enviar áudio de seu microfone para a máquina na nuvem, que transcreve o áudio e retorna o texto transcrito.
+This project is divided into two parts: one running on the user's machine and the other can run in the cloud or locally. The user can send audio from their microphone to the cloud-based machine, which transcribes the audio and returns the text transcribed.
 
 ---
 
 ## Installation
 
-Recomenda-se usar um ambiente virtual para gerenciar as dependências:
+To install the project, follow these steps:
 
-1. **Criar e ativar um ambiente virtual:**
+1. **Create and activate a virtual environment**:
+```bash
+python -m venv venv
+```
 
-    ```bash
-    python -m venv venv
-    .\venv\Scripts\activate
-    ```
-
-2. **Instalar os pacotes necessários:**
-
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-**Alternativamente**, você pode instalar as dependências diretamente sem um ambiente virtual (não recomendado):
-
+2. **Activate the virtual environment**:
+```bash
+.\venv\Scripts\activate
+```
+or in Linux/Mac:
+```bash
+source venv/bin/activate
+```
+3. **Install required packages**:
 ```bash
 pip install -r requirements.txt
-Usar um ambiente virtual ajuda a manter as dependências do projeto isoladas e mais fáceis de gerenciar.
----
-Dependencies
-Este projeto utiliza o Whisper da OpenAI, licenciado sob a Licença MIT.
----
-License
-Este projeto é licenciado sob a Licença MIT.
----
-Contact
-Desenvolvido por Leandro Gonçalves. Para mais informações:
----
-Email: contato@znix.com.br
-GitHub: github.com/lunikdev
+```
+
+**Note**: Installing dependencies without a virtual environment is not recommended.
+
+## Dependencies
+
+This project uses Whisper from OpenAI, licensed under the MIT License.
+
+## License
+
+This project is licensed under the MIT License.
+
+## Contact
+
+Developed by Leandro Gonçalves. For more information:
+
+* Email: contato@znix.com.br
+* GitHub: github.com/lunikdev
