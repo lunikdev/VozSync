@@ -1,0 +1,10 @@
+websockets
+pyaudio
+numpy
+torch
+keyboard
+python-dotenv
+noisereduce
+pydub
+openai-whisper
+nest_asyncio
