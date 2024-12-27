@@ -1,46 +1,40 @@
 # VozSync
-This project is divided into two parts: one runs on the user's machine and the other can run in the cloud or locally. The user can send audio from their microphone to the cloud machine, which transcribes the audio and returns the transcribed text.
+
+Este projeto é dividido em duas partes: uma roda na máquina do usuário e a outra pode rodar na nuvem ou localmente. O usuário pode enviar áudio de seu microfone para a máquina na nuvem, que transcreve o áudio e retorna o texto transcrito.
 
 ---
 
 ## Installation
 
-It is recommended to use a virtual environment to manage dependencies:
+Recomenda-se usar um ambiente virtual para gerenciar as dependências:
 
-1. **Create and activate a virtual environment:**
+1. **Criar e ativar um ambiente virtual:**
 
     ```bash
     python -m venv venv
     .\venv\Scripts\activate
     ```
 
-2. **Install the required packages:**
+2. **Instalar os pacotes necessários:**
 
     ```bash
     pip install -r requirements.txt
     ```
 
-**Alternatively**, you can install the dependencies directly without a virtual environment (not recommended):
+**Alternativamente**, você pode instalar as dependências diretamente sem um ambiente virtual (não recomendado):
 
 ```bash
 pip install -r requirements.txt
-
-
-Using a virtual environment helps to keep your project dependencies isolated and manageable.
-
-
-## Dependencies
-
-This project uses [OpenAI's Whisper](https://github.com/openai/whisper), which is licensed under the [MIT License](https://opensource.org/licenses/MIT).
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
-
+Usar um ambiente virtual ajuda a manter as dependências do projeto isoladas e mais fáceis de gerenciar.
 ---
-
-## Contact
-
-Developed by **Leandro Gonçalves**. For more information:  
-- Email: contato@znix.com.br  
-- GitHub: [github.com/lunikdev](https://github.com/lunikdev)
+Dependencies
+Este projeto utiliza o Whisper da OpenAI, licenciado sob a Licença MIT.
+---
+License
+Este projeto é licenciado sob a Licença MIT.
+---
+Contact
+Desenvolvido por Leandro Gonçalves. Para mais informações:
+---
+Email: contato@znix.com.br
+GitHub: github.com/lunikdev
