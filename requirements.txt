@@ -8,3 +8,4 @@ noisereduce
 pydub
 openai-whisper
 nest_asyncio
+cryptography

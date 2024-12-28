@@ -1,75 +1,58 @@
+# client.py
+
 import asyncio
 import websockets
+import ssl
+import os
 import json
 import base64
 import numpy as np
 import whisper
-import torch  # Importing the torch module
+import torch
 from datetime import datetime
 import time
 import wave
 import io
 import sys
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
 
-def get_server_ip():
-    """Prompts the user to enter the server's public IP."""
-    while True:
-        server_ip = input("Enter the server's public IP (example: 192.168.1.1): ").strip()
-        if server_ip:
-            return server_ip
-        else:
-            print("Invalid IP. Please try again.")
+# Diretório e arquivos de certificados
+CERTS_DIR = "certs"
+CA_CERT = os.path.join(CERTS_DIR, "ca.crt")
+CLIENT_CERT = os.path.join(CERTS_DIR, "client.crt")
+CLIENT_KEY = os.path.join(CERTS_DIR, "client.key")
 
-def get_use_cuda():
-    """Asks the user whether to use CUDA (GPU) or CPU."""
-    while True:
-        choice = input("Do you want to use CUDA (GPU)? (y/n): ").strip().lower()
-        if choice in ['y', 'yes']:
-            return True
-        elif choice in ['n', 'no']:
-            return False
-        else:
-            print("Invalid input. Please respond with 'y' or 'n'.")
+def ensure_certs_client():
+    """
+    Garante que os certificados necessários existam.
+    Se não existirem, instrui o usuário a copiá-los do servidor.
+    """
+    if not os.path.exists(CERTS_DIR):
+        os.makedirs(CERTS_DIR)
 
-def get_language():
-    """Asks the user whether to use automatic language detection or specify a language."""
-    while True:
-        choice = input("Do you want the language to be detected automatically? (y/n): ").strip().lower()
-        if choice in ['y', 'yes']:
-            return "automatic"
-        elif choice in ['n', 'no']:
-            lang = input("Specify the language code (example: 'pt' for Portuguese): ").strip().lower()
-            if lang:
-                return lang
-            else:
-                print("Invalid language code. Please try again.")
-        else:
-            print("Invalid input. Please respond with 'y' or 'n'.")
+    # Verifica se o certificado CA existe
+    if not os.path.exists(CA_CERT):
+        print(f"Erro: Certificado CA não encontrado em '{CA_CERT}'.")
+        print("Por favor, copie 'ca.crt' do servidor para o diretório 'certs/'.")
+        sys.exit(1)
 
-# Coleta das configurações do usuário
-SERVER_IP = get_server_ip()
-SERVER_PORT = 9024  # Você também pode tornar isso configurável, se desejar
-
-USE_CUDA = get_use_cuda()
-
-LANGUAGE = get_language()
-
-# Determina o dispositivo com base em USE_CUDA e disponibilidade de CUDA
-if USE_CUDA and torch.cuda.is_available():
-    device = "cuda"
-else:
-    device = "cpu"
-    if USE_CUDA:
-        print("CUDA is not available. Using CPU instead.")
-
-print("Loading Whisper model...")
-model = whisper.load_model("medium", device=device)
-print(f"Model loaded on device: {device}")
-print(f"Language set to: {LANGUAGE if LANGUAGE != 'automatic' else 'Automatic'}")
+    # Verifica se o certificado do cliente e a chave existem
+    if not os.path.exists(CLIENT_CERT) or not os.path.exists(CLIENT_KEY):
+        print(f"Erro: Certificado do cliente ou chave privada não encontrados em '{CLIENT_CERT}' ou '{CLIENT_KEY}'.")
+        print("Por favor, copie 'client.crt' e 'client.key' do servidor para o diretório 'certs/'.")
+        sys.exit(1)
 
 class AudioClient:
-    def __init__(self, server_url):
+    def __init__(self, server_url, model, language, device, use_ssl=False):
         self.server_url = server_url
+        self.use_ssl = use_ssl
+        self.ssl_context = None
+        self.model = model  # Armazena o modelo Whisper
+        self.language = language
+        self.device = device
         self.files_processed = 0
         self.running = True
         self.connected = False
@@ -79,6 +62,20 @@ class AudioClient:
         self.connection_timeout = 60
         self.audio_buffer = []  # Buffer para chunks de áudio
         self.websocket = None  # Referência ao WebSocket
+
+        if self.use_ssl:
+            self.setup_ssl()
+
+    def setup_ssl(self):
+        """
+        Configura o contexto SSL para comunicação segura com autenticação mútua.
+        """
+        ensure_certs_client()
+        self.ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=CA_CERT)
+        self.ssl_context.load_cert_chain(certfile=CLIENT_CERT, keyfile=CLIENT_KEY)
+        self.ssl_context.check_hostname = False  # Defina como True se o hostname do servidor for válido e corresponder ao certificado
+        self.ssl_context.verify_mode = ssl.CERT_REQUIRED
+        print("Contexto SSL configurado para o cliente.")
 
     def update_status(self, message, status_type='info'):
         """Atualiza o status no console"""
@@ -105,11 +102,11 @@ class AudioClient:
     async def transcribe_audio(self, audio_float):
         """Realiza a transcrição do áudio"""
         try:
-            result = model.transcribe(
+            result = self.model.transcribe(
                 audio=audio_float,
-                language=None if LANGUAGE == "automatic" else LANGUAGE,
+                language=None if self.language == "automatic" else self.language,
                 task="transcribe",
-                fp16=(device == "cuda")  # Use fp16 se estiver na GPU
+                fp16=(self.device == "cuda")  # Use fp16 se estiver na GPU
             )
 
             transcription = result["text"].strip()
@@ -195,6 +192,7 @@ class AudioClient:
             try:
                 async with websockets.connect(
                     self.server_url,
+                    ssl=self.ssl_context if self.use_ssl else None,
                     ping_interval=None,
                     max_size=20 * 1024 * 1024,
                     close_timeout=5
@@ -219,7 +217,7 @@ class AudioClient:
                             try:
                                 data = json.loads(message)
                                 await self.process_audio_data(
-                                    data['audio_data'],
+                                    data.get('audio_data', ''),
                                     {
                                         'type': data.get('type', 'chunk'),
                                         'timestamp': data.get('timestamp'),
@@ -250,20 +248,82 @@ class AudioClient:
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
 
-    async def handle_incoming_messages(self):
-        """Opcional: Lida com mensagens recebidas do servidor, se necessário"""
-        # Se precisar lidar com mensagens específicas do servidor, implemente aqui
-        pass
-
 async def main():
     """Função principal"""
-    client = AudioClient(f"ws://{SERVER_IP}:{SERVER_PORT}")
+    use_ssl_input = input("Deseja usar comunicação segura (SSL/TLS)? (y/n): ").strip().lower()
+    use_ssl = use_ssl_input in ['y', 'yes']
+
+    # Coleta das configurações do usuário
+    SERVER_IP = get_server_ip()
+    SERVER_PORT = 9024  # Você também pode tornar isso configurável, se desejar
+
+    USE_CUDA = get_use_cuda()
+
+    LANGUAGE = get_language()
+
+    # Determina o dispositivo com base em USE_CUDA e disponibilidade de CUDA
+    if USE_CUDA and torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+        if USE_CUDA:
+            print("CUDA não está disponível. Usando CPU em vez disso.")
+
+    print("Loading Whisper model...")
+    try:
+        model = whisper.load_model("medium", device=device)
+    except Exception as e:
+        print(f"Erro ao carregar o modelo Whisper: {e}")
+        sys.exit(1)
+    print(f"Model loaded on device: {device}")
+    print(f"Language set to: {LANGUAGE if LANGUAGE != 'automatic' else 'Automatic'}")
+
+    # Cria a URL do servidor com base na escolha de SSL
+    protocolo = 'wss' if use_ssl else 'ws'
+    server_url = f"{protocolo}://{SERVER_IP}:{SERVER_PORT}"
+
+    client = AudioClient(server_url, model, LANGUAGE, device, use_ssl=use_ssl)
     try:
         await client.connect_to_server()
     except KeyboardInterrupt:
         print("\nClosing connection...")
     finally:
         client.running = False
+
+def get_server_ip():
+    """Prompts the user to enter the server's public IP."""
+    while True:
+        server_ip = input("Enter the server's public IP (example: 192.168.1.1): ").strip()
+        if server_ip:
+            return server_ip
+        else:
+            print("Invalid IP. Please try again.")
+
+def get_use_cuda():
+    """Asks the user whether to use CUDA (GPU) or CPU."""
+    while True:
+        choice = input("Do you want to use CUDA (GPU)? (y/n): ").strip().lower()
+        if choice in ['y', 'yes']:
+            return True
+        elif choice in ['n', 'no']:
+            return False
+        else:
+            print("Invalid input. Please respond with 'y' or 'n'.")
+
+def get_language():
+    """Asks the user whether to use automatic language detection or specify a language."""
+    while True:
+        choice = input("Do you want the language to be detected automatically? (y/n): ").strip().lower()
+        if choice in ['y', 'yes']:
+            return "automatic"
+        elif choice in ['n', 'no']:
+            lang = input("Specify the language code (example: 'pt' for Portuguese): ").strip().lower()
+            if lang:
+                return lang
+            else:
+                print("Invalid language code. Please try again.")
+        else:
+            print("Invalid input. Please respond with 'y' or 'n'.")
 
 # Executa o cliente
 if __name__ == "__main__":
