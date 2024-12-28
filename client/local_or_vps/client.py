@@ -1,5 +1,3 @@
-# client.py
-
 import asyncio
 import websockets
 import ssl
@@ -190,10 +188,12 @@ class AudioClient:
         """Gerencia a conexão com o servidor"""
         while self.running:
             try:
+                self.update_status("Attempting to connect to the server...", 'info')
                 async with websockets.connect(
                     self.server_url,
                     ssl=self.ssl_context if self.use_ssl else None,
-                    ping_interval=None,
+                    ping_interval=20,       # Envia um ping a cada 20 segundos
+                    ping_timeout=10,        # Tempo limite para resposta do ping
                     max_size=20 * 1024 * 1024,
                     close_timeout=5
                 ) as websocket:
@@ -216,6 +216,7 @@ class AudioClient:
                             # Processa a mensagem
                             try:
                                 data = json.loads(message)
+                                self.update_status(f"Received message: {data}", 'info')
                                 await self.process_audio_data(
                                     data.get('audio_data', ''),
                                     {
@@ -233,10 +234,10 @@ class AudioClient:
                                 self.update_status("Connection timeout. Reconnecting...", 'warning')
                                 break
                         except websockets.exceptions.ConnectionClosed:
-                            self.update_status("Connection lost. Reconnecting...", 'warning')
+                            self.update_status("Connection closed by server. Reconnecting...", 'warning')
                             break
                         except Exception as e:
-                            self.update_status(f"Error: {str(e)}", 'error')
+                            self.update_status(f"Unexpected error: {str(e)}", 'error')
                             continue
 
             except Exception as e:
@@ -247,6 +248,11 @@ class AudioClient:
                 )
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
+
+    async def handle_incoming_messages(self):
+        """Opcional: Lida com mensagens recebidas do servidor, se necessário"""
+        # Se precisar lidar com mensagens específicas do servidor, implemente aqui
+        pass
 
 async def main():
     """Função principal"""
