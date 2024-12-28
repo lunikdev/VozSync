@@ -1,5 +1,3 @@
-# server.py
-
 import asyncio
 import websockets
 import ssl
@@ -20,8 +18,8 @@ import wave
 import keyboard
 import io
 import numpy as np
-import noisereduce as nr  # Importing noise reduction library
-from pydub import AudioSegment  # Importing audio processing library
+import noisereduce as nr  # Importando biblioteca de redução de ruído
+from pydub import AudioSegment  # Importando biblioteca de processamento de áudio
 from dotenv import load_dotenv, find_dotenv
 
 # Diretório e arquivos de certificados
@@ -178,15 +176,16 @@ class AudioServer:
         self.ssl_context = None
         self.clients = {}
         self.running = True
-        self.muted = False  # Mute state
+        self.muted = False  # Estado de mute
         # Buffer para 0.5 segundos de áudio
-        self.audio_buffer = collections.deque(maxlen=int((16000 // 1024) * 0.5))
+        self.audio_buffer = collections.deque(maxlen=int((16000 / 1024) * 0.5))
         self.long_term_noise_level = 0.0
         self.current_noise_level = 0.0
         self.ambient_noise_level = 0.0
         self.voice_activity_detected = False
         self.frames = []
         self.executor = ThreadPoolExecutor(max_workers=2)  # Executor para operações bloqueantes
+        self.force_send_event = threading.Event()  # Evento para forçar o envio do áudio
         self.setup_audio()
         if self.use_ssl:
             self.setup_ssl()
@@ -205,8 +204,8 @@ class AudioServer:
             self.chunk_size = 1024
             self.format = pyaudio.paInt16
             self.channels = 1
-            self.rate = 16000  # Sample rate (Hz)
-            self.record_seconds = 1  # Recording time per chunk
+            self.rate = 16000  # Taxa de amostragem (Hz)
+            self.record_seconds = 1  # Tempo de gravação por chunk
 
             print(f"[{self.get_timestamp()}] Configuração de Áudio:")
             print(f"Taxa de Amostragem: {self.rate} Hz")
@@ -278,47 +277,60 @@ class AudioServer:
             loop = asyncio.get_event_loop()
 
             while self.running:
-                if self.muted:
-                    await asyncio.sleep(0.1)  # Pausa breve quando está mudo
-                    continue
+                if not self.muted:
+                    try:
+                        # Ler dados de áudio de forma não bloqueante
+                        data = await loop.run_in_executor(
+                            self.executor,
+                            lambda: stream.read(self.chunk_size, exception_on_overflow=False)
+                        )
+                        if not data:
+                            continue
 
-                try:
-                    # Ler dados de áudio de forma não bloqueante
-                    data = await loop.run_in_executor(
-                        self.executor,
-                        lambda: stream.read(self.chunk_size, exception_on_overflow=False)
-                    )
-                    if not data:
-                        continue
+                        pegel = self.get_levels(data)
+                        self.audio_buffer.append(data)
 
-                    pegel = self.get_levels(data)
-                    self.audio_buffer.append(data)
+                        # Definir limiar para detecção de atividade vocal
+                        voice_threshold = self.long_term_noise_level + 300  # Ajuste conforme necessário
 
-                    # Definir limiar para detecção de atividade vocal
-                    voice_threshold = self.long_term_noise_level + 300  # Ajuste conforme necessário
+                        if self.voice_activity_detected:
+                            self.frames.append(data)
+                            if self.current_noise_level < self.ambient_noise_level + 100:
+                                # Fim da atividade vocal
+                                audio_bytes = b''.join(self.frames)
+                                if len(audio_bytes) > 0:
+                                    print(f"[{self.get_timestamp()}] Segmento de fala finalizado, enviando para os clientes.")
+                                    # Aplicar redução de ruído e normalização antes de enviar
+                                    processed_audio = self.process_audio(audio_bytes)
+                                    await self.send_audio_to_clients(processed_audio)
+                                self.frames = []
+                                self.voice_activity_detected = False
+                        else:
+                            if self.current_noise_level > voice_threshold:
+                                print(f"[{self.get_timestamp()}] Voz detectada!")
+                                self.voice_activity_detected = True
+                                self.ambient_noise_level = self.long_term_noise_level
+                                self.frames = list(self.audio_buffer)
 
-                    if self.voice_activity_detected:
-                        self.frames.append(data)
-                        if self.current_noise_level < self.ambient_noise_level + 100:
-                            # Fim da atividade vocal
-                            audio_bytes = b''.join(self.frames)
-                            if len(audio_bytes) > 0:
-                                print(f"[{self.get_timestamp()}] Segmento de fala finalizado, enviando para os clientes.")
-                                # Aplicar redução de ruído e normalização antes de enviar
-                                processed_audio = self.process_audio(audio_bytes)
-                                await self.send_audio_to_clients(processed_audio)
-                            self.frames = []
-                            self.voice_activity_detected = False
-                    else:
-                        if self.current_noise_level > voice_threshold:
-                            print(f"[{self.get_timestamp()}] Voz detectada!")
-                            self.voice_activity_detected = True
-                            self.ambient_noise_level = self.long_term_noise_level
-                            self.frames = list(self.audio_buffer)
+                    except Exception as e:
+                        print(f"[{self.get_timestamp()}] Erro ao capturar áudio: {e}")
+                        break
+                else:
+                    # Quando está mutado, não captura novos dados
+                    await asyncio.sleep(0.1)
 
-                except Exception as e:
-                    print(f"[{self.get_timestamp()}] Erro ao capturar áudio: {e}")
-                    break
+                # Verificar se o evento de força de envio foi sinalizado
+                if self.force_send_event.is_set():
+                    if self.frames:
+                        audio_bytes = b''.join(self.frames)
+                        if len(audio_bytes) > 0:
+                            print(f"[{self.get_timestamp()}] Forçando envio do áudio devido ao mute.")
+                            # Aplicar redução de ruído e normalização antes de enviar
+                            processed_audio = self.process_audio(audio_bytes)
+                            await self.send_audio_to_clients(processed_audio)
+                        self.frames = []
+                        self.voice_activity_detected = False
+                    self.force_send_event.clear()  # Resetar o evento
 
         except Exception as e:
             print(f"[{self.get_timestamp()}] Erro em broadcast_audio: {e}")
@@ -331,6 +343,16 @@ class AudioServer:
             print(f"[{self.get_timestamp()}] Captura de áudio parada.")
             await self.send_complete_audio()
 
+    def reset_audio_state(self):
+        """Reseta os buffers e estados de áudio para evitar envio de áudio residual."""
+        self.frames = []
+        self.audio_buffer.clear()
+        self.voice_activity_detected = False
+        self.ambient_noise_level = 0.0
+        self.long_term_noise_level = 0.0
+        self.current_noise_level = 0.0
+        print(f"[{self.get_timestamp()}] Estado de áudio resetado.")
+
     def process_audio(self, audio_bytes):
         """Aplica redução de ruído e normalização no áudio."""
         try:
@@ -341,9 +363,13 @@ class AudioServer:
             reduced_noise = nr.reduce_noise(y=audio_np, sr=self.rate)
 
             # Normalizar áudio para prevenir clipping
-            normalized_audio = np.int16(reduced_noise / np.max(np.abs(reduced_noise)) * 32767)
+            if np.max(np.abs(reduced_noise)) == 0:
+                normalized_audio = reduced_noise
+            else:
+                normalized_audio = reduced_noise / np.max(np.abs(reduced_noise)) * 32767
 
             # Converter de volta para bytes
+            normalized_audio = np.int16(normalized_audio)
             processed_bytes = normalized_audio.tobytes()
 
             return processed_bytes
@@ -415,8 +441,12 @@ class AudioServer:
                     current_time = time.time()
                     if current_time - last_toggle_time > toggle_cooldown:
                         self.muted = not self.muted
-                        status = "Mutado" if self.muted else "Ativo"  # Correção aqui
+                        status = "Mutado" if self.muted else "Ativo"
                         print(f"[{self.get_timestamp()}] Estado de mute alterado para: {status}")
+                        if self.muted:
+                            self.force_send_event.set()  # Sinaliza para enviar áudio imediatamente
+                        else:
+                            self.reset_audio_state()  # Reseta o estado de áudio ao desmutar
                         last_toggle_time = current_time
                 time.sleep(0.1)
 
@@ -441,7 +471,7 @@ class AudioServer:
                 ping_interval=None,
                 max_size=20 * 1024 * 1024
             ) as server:
-                protocolo = 'wss' if self.use_ssl else 'ws'  # Correção aqui
+                protocolo = 'wss' if self.use_ssl else 'ws'
                 print(f"[{self.get_timestamp()}] Servidor iniciado em {protocolo}://{self.host}:{self.port}")
                 print(f"[{self.get_timestamp()}] Pressione 'q' para desligar o servidor.")
                 print(f"[{self.get_timestamp()}] Pressione 'k' para alternar o mute do microfone.")
