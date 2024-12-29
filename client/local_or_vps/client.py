@@ -1,5 +1,3 @@
-# client.py
-
 import asyncio
 import websockets
 import ssl
@@ -92,8 +90,8 @@ class AudioClient:
         """Valida o formato do áudio"""
         if wf.getnchannels() != 1 or wf.getframerate() != 16000:
             self.update_status(
-                f"Invalid audio format - Channels: {wf.getnchannels()}, " +
-                f"Sample Rate: {wf.getframerate()} Hz",
+                f"Formato de áudio inválido - Canais: {wf.getnchannels()}, " +
+                f"Taxa de Amostragem: {wf.getframerate()} Hz",
                 'warning'
             )
             return False
@@ -106,21 +104,21 @@ class AudioClient:
                 audio=audio_float,
                 language=None if self.language == "automatic" else self.language,
                 task="transcribe",
-                fp16=(self.device == "cuda")  # Use fp16 se estiver na GPU
+                fp16=(self.device.type == "cuda")  # Use fp16 se estiver na GPU
             )
 
             transcription = result["text"].strip()
             if transcription:
                 self.files_processed += 1
                 self.update_status(
-                    f"Transcription {self.files_processed}: {transcription}",
+                    f"Transcrição {self.files_processed}: {transcription}",
                     'success'
                 )
                 # Envia a transcrição de volta para o servidor
                 await self.send_transcription(transcription)
                 return transcription
         except Exception as e:
-            self.update_status(f"Error during transcription: {str(e)}", 'error')
+            self.update_status(f"Erro durante a transcrição: {str(e)}", 'error')
             return None
 
     async def send_transcription(self, transcription):
@@ -133,9 +131,9 @@ class AudioClient:
             }
             try:
                 await self.websocket.send(json.dumps(message))
-                self.update_status(f"Transcription sent to server: {transcription}", 'info')
+                self.update_status(f"Transcrição enviada para o servidor: {transcription}", 'info')
             except Exception as e:
-                self.update_status(f"Error sending transcription: {str(e)}", 'error')
+                self.update_status(f"Erro ao enviar transcrição: {str(e)}", 'error')
 
     async def process_audio_data(self, audio_data_b64, message_info):
         """Processa os dados de áudio recebidos"""
@@ -148,7 +146,7 @@ class AudioClient:
             if message_type == "chunk":
                 # Log opcional para recepção
                 self.update_status(
-                    f"Receiving audio... ({len(audio_data)/1024:.1f}KB)",
+                    f"Recebendo áudio... ({len(audio_data)/1024:.1f}KB)",
                     'info'
                 )
                 return
@@ -169,14 +167,14 @@ class AudioClient:
 
                     # Verifica dados inválidos
                     if not np.all(np.isfinite(audio_float)):
-                        self.update_status("Invalid audio data detected", 'error')
+                        self.update_status("Dados de áudio inválidos detectados", 'error')
                         return
 
                     # Log do início da transcrição
                     file_size = len(audio_data) / 1024
                     self.update_status(
-                        f"Starting transcription - Size: {file_size:.1f}KB, " +
-                        f"Duration: {duration:.1f}s",
+                        f"Iniciando transcrição - Tamanho: {file_size:.1f}KB, " +
+                        f"Duração: {duration:.1f}s",
                         'info'
                     )
 
@@ -184,22 +182,24 @@ class AudioClient:
                     await self.transcribe_audio(audio_float)
 
         except Exception as e:
-            self.update_status(f"Error processing audio: {str(e)}", 'error')
+            self.update_status(f"Erro ao processar áudio: {str(e)}", 'error')
 
     async def connect_to_server(self):
         """Gerencia a conexão com o servidor"""
         while self.running:
             try:
+                self.update_status("Tentando conectar ao servidor...", 'info')
                 async with websockets.connect(
                     self.server_url,
                     ssl=self.ssl_context if self.use_ssl else None,
-                    ping_interval=None,
+                    ping_interval=20,       # Envia um ping a cada 20 segundos
+                    ping_timeout=10,        # Tempo limite para resposta do ping
                     max_size=20 * 1024 * 1024,
                     close_timeout=5
                 ) as websocket:
                     self.websocket = websocket  # Armazena a referência do WebSocket
                     self.connected = True
-                    self.update_status("Connected to the server!", 'success')
+                    self.update_status("Conectado ao servidor!", 'success')
 
                     while True:
                         try:
@@ -216,6 +216,7 @@ class AudioClient:
                             # Processa a mensagem
                             try:
                                 data = json.loads(message)
+                                self.update_status(f"Mensagem recebida: {data}", 'info')
                                 await self.process_audio_data(
                                     data.get('audio_data', ''),
                                     {
@@ -225,28 +226,82 @@ class AudioClient:
                                     }
                                 )
                             except json.JSONDecodeError as e:
-                                self.update_status(f"Error decoding message: {str(e)}", 'error')
+                                self.update_status(f"Erro ao decodificar mensagem: {str(e)}", 'error')
                                 continue
 
                         except asyncio.TimeoutError:
                             if time.time() - self.last_activity > self.connection_timeout:
-                                self.update_status("Connection timeout. Reconnecting...", 'warning')
+                                self.update_status("Timeout da conexão. Reconectando...", 'warning')
                                 break
                         except websockets.exceptions.ConnectionClosed:
-                            self.update_status("Connection lost. Reconnecting...", 'warning')
+                            self.update_status("Conexão fechada pelo servidor. Reconectando...", 'warning')
                             break
                         except Exception as e:
-                            self.update_status(f"Error: {str(e)}", 'error')
+                            self.update_status(f"Erro inesperado: {str(e)}", 'error')
                             continue
 
             except Exception as e:
                 self.connected = False
                 self.update_status(
-                    f"Connection error: {str(e)}\nAttempting to reconnect in {self.reconnect_delay} seconds...",
+                    f"Erro de conexão: {str(e)}\nTentando reconectar em {self.reconnect_delay} segundos...",
                     'error'
                 )
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
+
+    async def handle_incoming_messages(self):
+        """Opcional: Lida com mensagens recebidas do servidor, se necessário"""
+        # Se precisar lidar com mensagens específicas do servidor, implemente aqui
+        pass
+
+def get_server_ip():
+    """Solicita ao usuário que insira o IP público do servidor."""
+    while True:
+        server_ip = input("Digite o IP público do servidor (exemplo: 192.168.1.1): ").strip()
+        if server_ip:
+            return server_ip
+        else:
+            print("IP inválido. Por favor, tente novamente.")
+
+def get_use_cuda():
+    """Pergunta ao usuário se deseja usar CUDA (GPU) ou CPU."""
+    while True:
+        choice = input("Deseja usar CUDA (GPU)? (y/n): ").strip().lower()
+        if choice in ['y', 'yes']:
+            return True
+        elif choice in ['n', 'no']:
+            return False
+        else:
+            print("Entrada inválida. Responda com 'y' ou 'n'.")
+
+def get_language():
+    """Pergunta ao usuário se deseja detecção automática de idioma ou especificar um idioma."""
+    while True:
+        choice = input("Deseja que o idioma seja detectado automaticamente? (y/n): ").strip().lower()
+        if choice in ['y', 'yes']:
+            return "automatic"
+        elif choice in ['n', 'no']:
+            lang = input("Especifique o código do idioma (exemplo: 'pt' para Português): ").strip().lower()
+            if lang:
+                return lang
+            else:
+                print("Código de idioma inválido. Por favor, tente novamente.")
+        else:
+            print("Entrada inválida. Responda com 'y' ou 'n'.")
+
+def get_device(use_cuda):
+    """Determina o dispositivo a ser usado com base na disponibilidade de CUDA."""
+    if use_cuda and torch.cuda.is_available():
+        device = torch.device("cuda")
+        cuda_device_name = torch.cuda.get_device_name(0)
+        print(f"Usando dispositivo CUDA: {cuda_device_name}")
+    elif use_cuda and not torch.cuda.is_available():
+        device = torch.device("cpu")
+        print("CUDA não está disponível. Usando CPU em vez disso.")
+    else:
+        device = torch.device("cpu")
+        print("Usando CPU.")
+    return device
 
 async def main():
     """Função principal"""
@@ -262,21 +317,27 @@ async def main():
     LANGUAGE = get_language()
 
     # Determina o dispositivo com base em USE_CUDA e disponibilidade de CUDA
-    if USE_CUDA and torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
-        if USE_CUDA:
-            print("CUDA não está disponível. Usando CPU em vez disso.")
+    device = get_device(USE_CUDA)
 
-    print("Loading Whisper model...")
+    # Exibir informações de versão para depuração
+    print(f"\n=== Informações do Sistema ===")
+    print(f"PyTorch versão: {torch.__version__}")
+    print(f"CUDA disponível: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"Versão do CUDA: {torch.version.cuda}")
+        print(f"Número de GPUs disponíveis: {torch.cuda.device_count()}")
+        print(f"Nome da GPU: {torch.cuda.get_device_name(0)}")
+    print("=============================\n")
+
+    print("Carregando o modelo Whisper...")
     try:
-        model = whisper.load_model("medium", device=device)
+        model = whisper.load_model("medium")
+        model.to(device)  # Move o modelo para o dispositivo selecionado
     except Exception as e:
         print(f"Erro ao carregar o modelo Whisper: {e}")
         sys.exit(1)
-    print(f"Model loaded on device: {device}")
-    print(f"Language set to: {LANGUAGE if LANGUAGE != 'automatic' else 'Automatic'}")
+    print(f"Modelo carregado no dispositivo: {device}")
+    print(f"Idioma definido para: {LANGUAGE if LANGUAGE != 'automatic' else 'Automático'}\n")
 
     # Cria a URL do servidor com base na escolha de SSL
     protocolo = 'wss' if use_ssl else 'ws'
@@ -286,49 +347,14 @@ async def main():
     try:
         await client.connect_to_server()
     except KeyboardInterrupt:
-        print("\nClosing connection...")
+        print("\nFechando conexão...")
     finally:
         client.running = False
-
-def get_server_ip():
-    """Prompts the user to enter the server's public IP."""
-    while True:
-        server_ip = input("Enter the server's public IP (example: 192.168.1.1): ").strip()
-        if server_ip:
-            return server_ip
-        else:
-            print("Invalid IP. Please try again.")
-
-def get_use_cuda():
-    """Asks the user whether to use CUDA (GPU) or CPU."""
-    while True:
-        choice = input("Do you want to use CUDA (GPU)? (y/n): ").strip().lower()
-        if choice in ['y', 'yes']:
-            return True
-        elif choice in ['n', 'no']:
-            return False
-        else:
-            print("Invalid input. Please respond with 'y' or 'n'.")
-
-def get_language():
-    """Asks the user whether to use automatic language detection or specify a language."""
-    while True:
-        choice = input("Do you want the language to be detected automatically? (y/n): ").strip().lower()
-        if choice in ['y', 'yes']:
-            return "automatic"
-        elif choice in ['n', 'no']:
-            lang = input("Specify the language code (example: 'pt' for Portuguese): ").strip().lower()
-            if lang:
-                return lang
-            else:
-                print("Invalid language code. Please try again.")
-        else:
-            print("Invalid input. Please respond with 'y' or 'n'.")
 
 # Executa o cliente
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nClosing connection...")
+        print("\nFechando conexão...")
         sys.exit()
