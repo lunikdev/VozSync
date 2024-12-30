@@ -1,3 +1,5 @@
+# client.py
+
 import asyncio
 import websockets
 import ssl
@@ -16,12 +18,14 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
+from dotenv import load_dotenv, find_dotenv  # Para carregar variáveis de ambiente
 
 # Diretório e arquivos de certificados
 CERTS_DIR = "certs"
 CA_CERT = os.path.join(CERTS_DIR, "ca.crt")
 CLIENT_CERT = os.path.join(CERTS_DIR, "client.crt")
 CLIENT_KEY = os.path.join(CERTS_DIR, "client.key")
+
 
 def ensure_certs_client():
     """
@@ -43,12 +47,14 @@ def ensure_certs_client():
         print("Por favor, copie 'client.crt' e 'client.key' do servidor para o diretório 'certs/'.")
         sys.exit(1)
 
+
 class AudioClient:
-    def __init__(self, server_url, model, language, device, use_ssl=False):
+    def __init__(self, server_url, port, model, language, device, use_ssl=False, auth_token=None):
         self.server_url = server_url
+        self.port = port
         self.use_ssl = use_ssl
         self.ssl_context = None
-        self.model = model  # Armazena o modelo Whisper
+        self.model = model  # Modelo Whisper
         self.language = language
         self.device = device
         self.files_processed = 0
@@ -60,6 +66,7 @@ class AudioClient:
         self.connection_timeout = 60
         self.audio_buffer = []  # Buffer para chunks de áudio
         self.websocket = None  # Referência ao WebSocket
+        self.auth_token = auth_token  # Token de autenticação
 
         if self.use_ssl:
             self.setup_ssl()
@@ -71,7 +78,7 @@ class AudioClient:
         ensure_certs_client()
         self.ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=CA_CERT)
         self.ssl_context.load_cert_chain(certfile=CLIENT_CERT, keyfile=CLIENT_KEY)
-        self.ssl_context.check_hostname = False  # Defina como True se o hostname do servidor for válido e corresponder ao certificado
+        self.ssl_context.check_hostname = False
         self.ssl_context.verify_mode = ssl.CERT_REQUIRED
         print("Contexto SSL configurado para o cliente.")
 
@@ -104,7 +111,7 @@ class AudioClient:
                 audio=audio_float,
                 language=None if self.language == "automatic" else self.language,
                 task="transcribe",
-                fp16=(self.device.type == "cuda")  # Use fp16 se estiver na GPU
+                fp16=(self.device.type == "cuda")
             )
 
             transcription = result["text"].strip()
@@ -114,7 +121,6 @@ class AudioClient:
                     f"Transcrição {self.files_processed}: {transcription}",
                     'success'
                 )
-                # Envia a transcrição de volta para o servidor
                 await self.send_transcription(transcription)
                 return transcription
         except Exception as e:
@@ -144,7 +150,6 @@ class AudioClient:
 
             # Se for um chunk de áudio contínuo
             if message_type == "chunk":
-                # Log opcional para recepção
                 self.update_status(
                     f"Recebendo áudio... ({len(audio_data)/1024:.1f}KB)",
                     'info'
@@ -189,34 +194,40 @@ class AudioClient:
         while self.running:
             try:
                 self.update_status("Tentando conectar ao servidor...", 'info')
+                
+                # Criar a URL sem o token
+                protocolo = 'wss' if self.use_ssl else 'ws'
+                server_url = f"{protocolo}://{self.server_url}:{self.port}"
+                
+                # Criar o objeto de conexão com as opções corretas
                 async with websockets.connect(
-                    self.server_url,
+                    server_url,
                     ssl=self.ssl_context if self.use_ssl else None,
-                    ping_interval=20,       # Envia um ping a cada 20 segundos
-                    ping_timeout=10,        # Tempo limite para resposta do ping
+                    ping_interval=20,
+                    ping_timeout=10,
                     max_size=20 * 1024 * 1024,
-                    close_timeout=5
+                    subprotocols=None,
+                    compression=None,
+                    additional_headers={
+                        'Authorization': f'Bearer {self.auth_token}'
+                    }
                 ) as websocket:
-                    self.websocket = websocket  # Armazena a referência do WebSocket
+                    self.websocket = websocket
                     self.connected = True
                     self.update_status("Conectado ao servidor!", 'success')
 
                     while True:
                         try:
-                            # Espera por uma mensagem com timeout
                             message = await asyncio.wait_for(
                                 websocket.recv(),
                                 timeout=self.connection_timeout
                             )
 
-                            # Reseta o delay de reconexão após sucesso
                             self.reconnect_delay = 1
                             self.last_activity = time.time()
 
-                            # Processa a mensagem
                             try:
                                 data = json.loads(message)
-                                self.update_status(f"Mensagem recebida: {data}", 'info')
                                 await self.process_audio_data(
                                     data.get('audio_data', ''),
                                     {
@@ -251,7 +262,6 @@ class AudioClient:
 
     async def handle_incoming_messages(self):
         """Opcional: Lida com mensagens recebidas do servidor, se necessário"""
-        # Se precisar lidar com mensagens específicas do servidor, implemente aqui
         pass
 
 def get_server_ip():
@@ -263,6 +273,7 @@ def get_server_ip():
         else:
             print("IP inválido. Por favor, tente novamente.")
 
+
 def get_use_cuda():
     """Pergunta ao usuário se deseja usar CUDA (GPU) ou CPU."""
     while True:
@@ -273,6 +284,7 @@ def get_use_cuda():
             return False
         else:
             print("Entrada inválida. Responda com 'y' ou 'n'.")
+
 
 def get_language():
     """Pergunta ao usuário se deseja detecção automática de idioma ou especificar um idioma."""
@@ -289,6 +301,7 @@ def get_language():
         else:
             print("Entrada inválida. Responda com 'y' ou 'n'.")
 
+
 def get_device(use_cuda):
     """Determina o dispositivo a ser usado com base na disponibilidade de CUDA."""
     if use_cuda and torch.cuda.is_available():
@@ -303,6 +316,7 @@ def get_device(use_cuda):
         print("Usando CPU.")
     return device
 
+
 async def main():
     """Função principal"""
     use_ssl_input = input("Deseja usar comunicação segura (SSL/TLS)? (y/n): ").strip().lower()
@@ -313,8 +327,18 @@ async def main():
     SERVER_PORT = 9024  # Você também pode tornar isso configurável, se desejar
 
     USE_CUDA = get_use_cuda()
-
     LANGUAGE = get_language()
+
+    # Carregar variáveis de ambiente do arquivo .env
+    load_dotenv(find_dotenv())
+
+    # Obter o token de autenticação do arquivo .env ou solicitar ao usuário
+    AUTH_TOKEN = os.getenv("AUTH_TOKEN")
+    if not AUTH_TOKEN:
+        AUTH_TOKEN = input("Digite o token de autenticação: ").strip()
+
+    # Log do token que será usado
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Token de autenticação configurado")
 
     # Determina o dispositivo com base em USE_CUDA e disponibilidade de CUDA
     device = get_device(USE_CUDA)
@@ -339,11 +363,16 @@ async def main():
     print(f"Modelo carregado no dispositivo: {device}")
     print(f"Idioma definido para: {LANGUAGE if LANGUAGE != 'automatic' else 'Automático'}\n")
 
-    # Cria a URL do servidor com base na escolha de SSL
-    protocolo = 'wss' if use_ssl else 'ws'
-    server_url = f"{protocolo}://{SERVER_IP}:{SERVER_PORT}"
+    client = AudioClient(
+        server_url=SERVER_IP,
+        port=SERVER_PORT,
+        model=model,
+        language=LANGUAGE,
+        device=device,
+        use_ssl=use_ssl,
+        auth_token=AUTH_TOKEN
+    )
 
-    client = AudioClient(server_url, model, LANGUAGE, device, use_ssl=use_ssl)
     try:
         await client.connect_to_server()
     except KeyboardInterrupt:
