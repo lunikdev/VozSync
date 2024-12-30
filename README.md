@@ -100,7 +100,7 @@ python client.py
 ```
 
 #### Client on Google Colab
-To run the client on Google Colab, use the `client_colab.py` script and follow the instructions in the notebook.
+To run the client on Google Colab, use the `Whisper.ipynb` script and follow the instructions in the notebook.
 
 ---
 
