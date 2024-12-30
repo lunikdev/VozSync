@@ -1,3 +1,5 @@
+# server.py
+
 import asyncio
 import websockets
 import ssl
@@ -18,9 +20,20 @@ import wave
 import keyboard
 import io
 import numpy as np
-import noisereduce as nr  # Importando biblioteca de redução de ruído
-from pydub import AudioSegment  # Importando biblioteca de processamento de áudio
+import noisereduce as nr  # Biblioteca de redução de ruído
 from dotenv import load_dotenv, find_dotenv
+from urllib.parse import urlparse, parse_qs  # Para análise de URLs
+
+# Carregar variáveis de ambiente do arquivo .env
+load_dotenv(find_dotenv())
+
+# Obter o token de autenticação do arquivo .env
+AUTH_TOKEN = os.getenv("AUTH_TOKEN")
+if not AUTH_TOKEN:
+    raise EnvironmentError("AUTH_TOKEN não está definido no arquivo .env")
+
+# Adicione este print para verificar se o token foi carregado corretamente
+print(f"[{datetime.now().strftime('%H:%M:%S')}] AUTH_TOKEN carregado: '{AUTH_TOKEN}'")
 
 # Diretório e arquivos de certificados
 CERTS_DIR = "certs"
@@ -66,7 +79,6 @@ def ensure_certs():
         ).not_valid_before(
             datetime.utcnow()
         ).not_valid_after(
-            # Certificado válido por 10 anos
             datetime.utcnow() + timedelta(days=3650)
         ).add_extension(
             x509.BasicConstraints(ca=True, path_length=None), critical=True,
@@ -176,16 +188,18 @@ class AudioServer:
         self.ssl_context = None
         self.clients = {}
         self.running = True
-        self.muted = False  # Estado de mute
-        # Buffer para 0.5 segundos de áudio
+        self.muted = False
         self.audio_buffer = collections.deque(maxlen=int((16000 / 1024) * 0.5))
         self.long_term_noise_level = 0.0
         self.current_noise_level = 0.0
         self.ambient_noise_level = 0.0
         self.voice_activity_detected = False
         self.frames = []
-        self.executor = ThreadPoolExecutor(max_workers=2)  # Executor para operações bloqueantes
-        self.force_send_event = threading.Event()  # Evento para forçar o envio do áudio
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.force_send_event = threading.Event()
+        self.AUTH_TOKEN = os.getenv("AUTH_TOKEN")  # Armazenar o token como atributo da classe
+        if not self.AUTH_TOKEN:
+            raise EnvironmentError("AUTH_TOKEN não está definido no arquivo .env")
         self.setup_audio()
         if self.use_ssl:
             self.setup_ssl()
@@ -217,33 +231,67 @@ class AudioServer:
     def get_timestamp(self):
         return datetime.now().strftime("%H:%M:%S")
 
+    async def register(self, websocket):
+        """
+        Gerencia o registro de novos clientes.
+        Versão atualizada para websockets 14.1
+        """
+        client_info = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
+        
+        try:
+            # Na versão 14.1 do websockets, os headers estão em websocket.request.headers
+            request_headers = getattr(websocket, 'request', None)
+            if request_headers:
+                auth_header = request_headers.headers.get('Authorization', '')
+            else:
+                # Fallback para a forma antiga de obter os headers
+                auth_header = ''
+            
+            if not auth_header or not auth_header.startswith('Bearer '):
+                print(f"[{self.get_timestamp()}] Token ausente ou formato inválido de {client_info}")
+                await websocket.close(1002, reason='Token ausente ou formato inválido')
+                return
+                
+            token = auth_header.split('Bearer ')[1].strip()
+            
+            # Log do token recebido (apenas para debug)
+            print(f"[{self.get_timestamp()}] Token recebido de {client_info}")
+
+            if token != self.AUTH_TOKEN:
+                print(f"[{self.get_timestamp()}] Token inválido de {client_info}")
+                await websocket.close(1002, reason='Token inválido')
+                return
+
+            print(f"[{self.get_timestamp()}] Nova conexão de {client_info} autenticada com sucesso.")
+            
+            self.clients[client_info] = {
+                'websocket': websocket,
+                'last_ping': time.time()
+            }
+
+            try:
+                async for message in websocket:
+                    await self.handle_message(message, client_info)
+            except websockets.exceptions.ConnectionClosed as e:
+                print(f"[{self.get_timestamp()}] Cliente {client_info} desconectado: {e}")
+            except Exception as e:
+                print(f"[{self.get_timestamp()}] Erro com cliente {client_info}: {e}")
+            finally:
+                if client_info in self.clients:
+                    del self.clients[client_info]
+                print(f"[{self.get_timestamp()}] Cliente {client_info} removido da lista de conexões")
+                
+        except Exception as e:
+            print(f"[{self.get_timestamp()}] Erro na autenticação de {client_info}: {e}")
+            await websocket.close(1002, reason='Erro na autenticação')
+            return
+
     def get_levels(self, data):
         """Calcula o nível de volume do áudio."""
         pegel = np.abs(np.frombuffer(data, dtype=np.int16)).mean()
         self.long_term_noise_level = self.long_term_noise_level * 0.995 + pegel * (1.0 - 0.995)
         self.current_noise_level = self.current_noise_level * 0.920 + pegel * (1.0 - 0.920)
         return pegel
-
-    async def register(self, websocket, path=None):
-        client_info = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
-        print(f"[{self.get_timestamp()}] Nova conexão de {client_info}")
-
-        self.clients[client_info] = {
-            'websocket': websocket,
-            'last_ping': time.time()
-        }
-
-        try:
-            async for message in websocket:
-                await self.handle_message(message, client_info)
-        except websockets.exceptions.ConnectionClosed as e:
-            print(f"[{self.get_timestamp()}] Cliente {client_info} desconectado: {e}")
-        except Exception as e:
-            print(f"[{self.get_timestamp()}] Erro com cliente {client_info}: {e}")
-        finally:
-            if client_info in self.clients:
-                del self.clients[client_info]
-            print(f"[{self.get_timestamp()}] Cliente {client_info} removido da lista de conexões")
 
     async def handle_message(self, message, client_info):
         """Processa mensagens recebidas dos clientes."""
@@ -254,7 +302,6 @@ class AudioServer:
                 transcription = data.get("text", "")
                 timestamp = data.get("timestamp", self.get_timestamp())
                 print(f"[{timestamp}] Transcrição recebida de {client_info}: {transcription}")
-                # Aqui você pode adicionar lógica para processar a transcrição, como salvar em um arquivo, etc.
             else:
                 print(f"[{self.get_timestamp()}] Tipo de mensagem desconhecido de {client_info}: {message_type}")
         except json.JSONDecodeError as e:
@@ -469,7 +516,9 @@ class AudioServer:
                 self.port,
                 ssl=self.ssl_context if self.use_ssl else None,
                 ping_interval=None,
-                max_size=20 * 1024 * 1024
+                max_size=20 * 1024 * 1024,
+                process_request=None,
+                compression=None
             ) as server:
                 protocolo = 'wss' if self.use_ssl else 'ws'
                 print(f"[{self.get_timestamp()}] Servidor iniciado em {protocolo}://{self.host}:{self.port}")
