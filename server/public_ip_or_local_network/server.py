@@ -23,6 +23,8 @@ import numpy as np
 import noisereduce as nr  # Biblioteca de redução de ruído
 from dotenv import load_dotenv, find_dotenv
 from urllib.parse import urlparse, parse_qs  # Para análise de URLs
+# Imports necessários para IPv6
+import socket
 
 # Carregar variáveis de ambiente do arquivo .env
 load_dotenv(find_dotenv())
@@ -181,10 +183,11 @@ def ensure_certs():
 
 
 class AudioServer:
-    def __init__(self, host="0.0.0.0", port=9024, use_ssl=False):
-        self.host = host
+    def __init__(self, host="0.0.0.0", port=9024, use_ssl=False, use_ipv6=False):
+        self.host = "::" if use_ipv6 else host  # :: is the IPv6 equivalent of 0.0.0.0
         self.port = port
         self.use_ssl = use_ssl
+        self.use_ipv6 = use_ipv6
         self.ssl_context = None
         self.clients = {}
         self.running = True
@@ -197,7 +200,7 @@ class AudioServer:
         self.frames = []
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.force_send_event = threading.Event()
-        self.AUTH_TOKEN = os.getenv("AUTH_TOKEN")  # Armazenar o token como atributo da classe
+        self.AUTH_TOKEN = os.getenv("AUTH_TOKEN")
         if not self.AUTH_TOKEN:
             raise EnvironmentError("AUTH_TOKEN não está definido no arquivo .env")
         self.setup_audio()
@@ -510,37 +513,57 @@ class AudioServer:
         self.handle_keys()
 
         try:
-            async with websockets.serve(
-                self.register,
-                self.host,
-                self.port,
-                ssl=self.ssl_context if self.use_ssl else None,
-                ping_interval=None,
-                max_size=20 * 1024 * 1024,
-                process_request=None,
-                compression=None
-            ) as server:
+            if self.use_ipv6:
+                # Configurações específicas para IPv6
+                socket_kwargs = {
+                    'family': socket.AF_INET6,
+                    'host': self.host,
+                    'port': self.port,
+                    'ssl': self.ssl_context if self.use_ssl else None,
+                    'ping_interval': None,
+                    'max_size': 20 * 1024 * 1024,
+                    'process_request': None,
+                    'compression': None
+                }
+            else:
+                # Configurações para IPv4
+                socket_kwargs = {
+                    'host': self.host,
+                    'port': self.port,
+                    'ssl': self.ssl_context if self.use_ssl else None,
+                    'ping_interval': None,
+                    'max_size': 20 * 1024 * 1024,
+                    'process_request': None,
+                    'compression': None
+                }
+
+            async with websockets.serve(self.register, **socket_kwargs) as server:
                 protocolo = 'wss' if self.use_ssl else 'ws'
-                print(f"[{self.get_timestamp()}] Servidor iniciado em {protocolo}://{self.host}:{self.port}")
+                ip_version = 'IPv6' if self.use_ipv6 else 'IPv4'
+                print(f"[{self.get_timestamp()}] Servidor {ip_version} iniciado em {protocolo}://{self.host}:{self.port}")
                 print(f"[{self.get_timestamp()}] Pressione 'q' para desligar o servidor.")
                 print(f"[{self.get_timestamp()}] Pressione 'k' para alternar o mute do microfone.")
 
-                # Iniciar a tarefa de transmissão de áudio
                 broadcast_task = asyncio.create_task(self.broadcast_audio())
-
-                # Aguardar até que o servidor esteja em execução e a transmissão seja concluída
                 await asyncio.gather(server.wait_closed(), broadcast_task)
+
         except Exception as e:
             print(f"[{self.get_timestamp()}] Erro em start_server: {e}")
         finally:
             self.cleanup()
 
-
 if __name__ == "__main__":
+    
+    # Perguntar sobre o tipo de IP
+    ip_version = input("Qual versão do IP deseja usar? (4/6) [4]: ").strip() or "4"
+    use_ipv6 = ip_version == "6"
+    
+    # Perguntar sobre SSL
     use_ssl_input = input("Deseja usar comunicação segura (SSL/TLS)? (y/n): ").strip().lower()
     use_ssl = use_ssl_input in ['y', 'yes']
 
-    server = AudioServer(use_ssl=use_ssl)
+    # Criar o servidor com as configurações escolhidas
+    server = AudioServer(use_ssl=use_ssl, use_ipv6=use_ipv6)
 
     try:
         asyncio.run(server.start_server())

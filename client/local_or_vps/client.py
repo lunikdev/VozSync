@@ -19,6 +19,8 @@ from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
 from dotenv import load_dotenv, find_dotenv  # Para carregar variáveis de ambiente
+# Imports necessários para IPv6
+import socket
 
 # Diretório e arquivos de certificados
 CERTS_DIR = "certs"
@@ -49,12 +51,13 @@ def ensure_certs_client():
 
 
 class AudioClient:
-    def __init__(self, server_url, port, model, language, device, use_ssl=False, auth_token=None):
+    def __init__(self, server_url, port, model, language, device, use_ssl=False, auth_token=None, use_ipv6=False):
         self.server_url = server_url
         self.port = port
         self.use_ssl = use_ssl
+        self.use_ipv6 = use_ipv6
         self.ssl_context = None
-        self.model = model  # Modelo Whisper
+        self.model = model
         self.language = language
         self.device = device
         self.files_processed = 0
@@ -64,9 +67,9 @@ class AudioClient:
         self.max_reconnect_delay = 30
         self.last_activity = time.time()
         self.connection_timeout = 60
-        self.audio_buffer = []  # Buffer para chunks de áudio
-        self.websocket = None  # Referência ao WebSocket
-        self.auth_token = auth_token  # Token de autenticação
+        self.audio_buffer = []
+        self.websocket = None
+        self.auth_token = auth_token
 
         if self.use_ssl:
             self.setup_ssl()
@@ -190,31 +193,43 @@ class AudioClient:
             self.update_status(f"Erro ao processar áudio: {str(e)}", 'error')
 
     async def connect_to_server(self):
-        """Gerencia a conexão com o servidor"""
+        """Gerencia a conexão com o servidor com suporte a IPv6"""
         while self.running:
             try:
                 self.update_status("Tentando conectar ao servidor...", 'info')
                 
-                # Criar a URL sem o token
+                # Criar a URL com o formato apropriado para IPv6 ou IPv4
                 protocolo = 'wss' if self.use_ssl else 'ws'
-                server_url = f"{protocolo}://{self.server_url}:{self.port}"
-                
-                # Criar o objeto de conexão com as opções corretas
-                async with websockets.connect(
-                    server_url,
-                    ssl=self.ssl_context if self.use_ssl else None,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    max_size=20 * 1024 * 1024,
-                    subprotocols=None,
-                    compression=None,
-                    additional_headers={
+                if self.use_ipv6:
+                    # Para IPv6, envolvemos o endereço em colchetes
+                    if ':' in self.server_url:  # Verifica se é um endereço IPv6
+                        server_url = f"{protocolo}://[{self.server_url}]:{self.port}"
+                    else:
+                        server_url = f"{protocolo}://{self.server_url}:{self.port}"
+                else:
+                    server_url = f"{protocolo}://{self.server_url}:{self.port}"
+
+                # Configurar as opções de conexão específicas para IPv6 se necessário
+                connection_kwargs = {
+                    'uri': server_url,
+                    'ssl': self.ssl_context if self.use_ssl else None,
+                    'ping_interval': 20,
+                    'ping_timeout': 10,
+                    'max_size': 20 * 1024 * 1024,
+                    'compression': None,
+                    'additional_headers': {
                         'Authorization': f'Bearer {self.auth_token}'
                     }
-                ) as websocket:
+                }
+
+                if self.use_ipv6:
+                    # Adicionar configurações específicas para IPv6
+                    connection_kwargs['family'] = socket.AF_INET6
+
+                async with websockets.connect(**connection_kwargs) as websocket:
                     self.websocket = websocket
                     self.connected = True
-                    self.update_status("Conectado ao servidor!", 'success')
+                    self.update_status(f"Conectado ao servidor via {'IPv6' if self.use_ipv6 else 'IPv4'}!", 'success')
 
                     while True:
                         try:
@@ -264,15 +279,30 @@ class AudioClient:
         """Opcional: Lida com mensagens recebidas do servidor, se necessário"""
         pass
 
-def get_server_ip():
-    """Solicita ao usuário que insira o IP público do servidor."""
+def get_server_ip(use_ipv6):
+    """Solicita ao usuário que insira o IP do servidor com suporte a IPv6."""
     while True:
-        server_ip = input("Digite o IP público do servidor (exemplo: 192.168.1.1): ").strip()
-        if server_ip:
-            return server_ip
+        if use_ipv6:
+            print("Digite o endereço IPv6 do servidor (exemplo: 2001:db8::1)")
+            print("Ou deixe em branco para usar 'localhost' (::1)")
         else:
-            print("IP inválido. Por favor, tente novamente.")
-
+            print("Digite o endereço IPv4 do servidor (exemplo: 192.168.1.1)")
+            print("Ou deixe em branco para usar 'localhost' (127.0.0.1)")
+            
+        server_ip = input("Endereço do servidor: ").strip()
+        
+        if not server_ip:
+            return "::1" if use_ipv6 else "127.0.0.1"
+        
+        # Validação básica do formato do endereço
+        if use_ipv6:
+            if ':' in server_ip:  # Verificação simples para IPv6
+                return server_ip
+            print("Formato de IPv6 inválido. Tente novamente.")
+        else:
+            if '.' in server_ip:  # Verificação simples para IPv4
+                return server_ip
+            print("Formato de IPv4 inválido. Tente novamente.")
 
 def get_use_cuda():
     """Pergunta ao usuário se deseja usar CUDA (GPU) ou CPU."""
@@ -318,50 +348,54 @@ def get_device(use_cuda):
 
 
 async def main():
-    """Função principal"""
+    """Função principal com suporte a IPv6"""
+    # Primeiro, perguntar sobre a versão do IP
+    ip_version = input("Qual versão do IP deseja usar? (4/6) [4]: ").strip() or "4"
+    use_ipv6 = ip_version == "6"
+
     use_ssl_input = input("Deseja usar comunicação segura (SSL/TLS)? (y/n): ").strip().lower()
     use_ssl = use_ssl_input in ['y', 'yes']
 
-    # Coleta das configurações do usuário
-    SERVER_IP = get_server_ip()
-    SERVER_PORT = 9024  # Você também pode tornar isso configurável, se desejar
+    # Coleta das configurações do usuário com suporte a IPv6
+    SERVER_IP = get_server_ip(use_ipv6)
+    SERVER_PORT = 9024
 
     USE_CUDA = get_use_cuda()
     LANGUAGE = get_language()
 
-    # Carregar variáveis de ambiente do arquivo .env
+    # Carregar variáveis de ambiente
     load_dotenv(find_dotenv())
-
-    # Obter o token de autenticação do arquivo .env ou solicitar ao usuário
     AUTH_TOKEN = os.getenv("AUTH_TOKEN")
     if not AUTH_TOKEN:
         AUTH_TOKEN = input("Digite o token de autenticação: ").strip()
 
-    # Log do token que será usado
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Token de autenticação configurado")
+    # Log das configurações
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Configurações:")
+    print(f"Versão IP: {'IPv6' if use_ipv6 else 'IPv4'}")
+    print(f"Endereço do servidor: {SERVER_IP}")
+    print(f"Token de autenticação configurado")
 
-    # Determina o dispositivo com base em USE_CUDA e disponibilidade de CUDA
+    # Configuração do dispositivo e modelo
     device = get_device(USE_CUDA)
 
-    # Exibir informações de versão para depuração
-    print(f"\n=== Informações do Sistema ===")
+    print("\n=== Informações do Sistema ===")
     print(f"PyTorch versão: {torch.__version__}")
     print(f"CUDA disponível: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"Versão do CUDA: {torch.version.cuda}")
-        print(f"Número de GPUs disponíveis: {torch.cuda.device_count()}")
-        print(f"Nome da GPU: {torch.cuda.get_device_name(0)}")
-    print("=============================\n")
+        print(f"GPUs disponíveis: {torch.cuda.device_count()}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print("===========================\n")
 
     print("Carregando o modelo Whisper...")
     try:
         model = whisper.load_model("medium")
-        model.to(device)  # Move o modelo para o dispositivo selecionado
+        model.to(device)
     except Exception as e:
         print(f"Erro ao carregar o modelo Whisper: {e}")
         sys.exit(1)
     print(f"Modelo carregado no dispositivo: {device}")
-    print(f"Idioma definido para: {LANGUAGE if LANGUAGE != 'automatic' else 'Automático'}\n")
+    print(f"Idioma: {LANGUAGE if LANGUAGE != 'automatic' else 'Automático'}\n")
 
     client = AudioClient(
         server_url=SERVER_IP,
@@ -370,7 +404,8 @@ async def main():
         language=LANGUAGE,
         device=device,
         use_ssl=use_ssl,
-        auth_token=AUTH_TOKEN
+        auth_token=AUTH_TOKEN,
+        use_ipv6=use_ipv6
     )
 
     try:
