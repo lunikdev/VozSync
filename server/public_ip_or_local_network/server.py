@@ -25,6 +25,53 @@ from dotenv import load_dotenv, find_dotenv
 from urllib.parse import urlparse, parse_qs  # Para análise de URLs
 # Imports necessários para IPv6
 import socket
+import json
+
+CONFIGS_DIR = "configs"
+SERVER_CONFIG_FILE = os.path.join(CONFIGS_DIR, "server_config.json")
+SELECTED_CLIENT_FILE = os.path.join(CONFIGS_DIR, "selected_client.json")
+
+# Adicione esta função para gerenciar as configurações
+def load_or_create_configs():
+    """Carrega ou cria as configurações do servidor."""
+    # Criar diretório de configs se não existir
+    if not os.path.exists(CONFIGS_DIR):
+        os.makedirs(CONFIGS_DIR)
+    
+    # Configuração padrão do servidor
+    default_config = {
+        "redundancy_level": 1,
+        "auto_select_first": True,
+        "use_ipv6": False,
+        "use_ssl": False
+    }
+    
+    # Carregar ou criar arquivo de configuração do servidor
+    if os.path.exists(SERVER_CONFIG_FILE):
+        with open(SERVER_CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+    else:
+        config = default_config
+        with open(SERVER_CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=4)  # Corrigido
+    
+    return config
+
+# Adicione esta função para salvar o cliente selecionado
+def save_selected_client(client_ip):
+    """Salva o cliente selecionado em um arquivo JSON."""
+    data = {"selected_client_ip": client_ip}
+    with open(SELECTED_CLIENT_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+# Adicione esta função para carregar o cliente selecionado
+def load_selected_client():
+    """Carrega o cliente selecionado do arquivo JSON."""
+    if os.path.exists(SELECTED_CLIENT_FILE):
+        with open(SELECTED_CLIENT_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get("selected_client_ip")
+    return None
 
 # Carregar variáveis de ambiente do arquivo .env
 load_dotenv(find_dotenv())
@@ -184,10 +231,13 @@ def ensure_certs():
 
 class AudioServer:
     def __init__(self, host="0.0.0.0", port=9024, use_ssl=False, use_ipv6=False):
-        self.host = "::" if use_ipv6 else host  # :: is the IPv6 equivalent of 0.0.0.0
+        # Carregar configurações
+        config = load_or_create_configs()
+        
+        self.host = "::" if config["use_ipv6"] else host
         self.port = port
-        self.use_ssl = use_ssl
-        self.use_ipv6 = use_ipv6
+        self.use_ssl = config["use_ssl"]
+        self.use_ipv6 = config["use_ipv6"]
         self.ssl_context = None
         self.clients = {}
         self.running = True
@@ -201,6 +251,12 @@ class AudioServer:
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.force_send_event = threading.Event()
         self.AUTH_TOKEN = os.getenv("AUTH_TOKEN")
+        # Configurações de redundância
+        self.redundancy_level = config["redundancy_level"]
+        self.auto_select_first = config["auto_select_first"]
+        self.selected_client = load_selected_client()
+        self.menu_active = False
+        self.next_client_id = 1
         if not self.AUTH_TOKEN:
             raise EnvironmentError("AUTH_TOKEN não está definido no arquivo .env")
         self.setup_audio()
@@ -234,60 +290,253 @@ class AudioServer:
     def get_timestamp(self):
         return datetime.now().strftime("%H:%M:%S")
 
+    async def handle_client_disconnect(self, client_info):
+        """Gerencia a desconexão de um cliente."""
+        try:
+            if client_info in self.clients:
+                was_selected = (client_info == self.selected_client)
+                client_id = self.clients[client_info]['client_id']
+                del self.clients[client_info]
+                print(f"[{self.get_timestamp()}] Cliente {client_info} removido da lista de conexões")
+                
+                if was_selected and self.clients:
+                    saved_client = load_selected_client()
+                    if saved_client and saved_client in self.clients:
+                        # Se o cliente salvo está disponível, seleciona ele
+                        self.selected_client = saved_client
+                        print(f"[{self.get_timestamp()}] Cliente prioritário #{self.clients[saved_client]['client_id']} selecionado automaticamente")
+                    else:
+                        # Caso contrário, seleciona o próximo disponível
+                        next_client_info = next(iter(self.clients))
+                        self.selected_client = next_client_info
+                        print(f"[{self.get_timestamp()}] Cliente #{self.clients[next_client_info]['client_id']} selecionado automaticamente")
+                elif was_selected:
+                    print(f"[{self.get_timestamp()}] Cliente selecionado desconectou e não há outros clientes disponíveis.")
+                    self.selected_client = None
+        except Exception as e:
+            print(f"[{self.get_timestamp()}] Erro ao desconectar cliente {client_info}: {e}")
+
+    @staticmethod
+    def extract_ip(websocket):
+        """Extrai apenas o IP do endereço do websocket."""
+        return websocket.remote_address[0]
+
     async def register(self, websocket):
-        """
-        Gerencia o registro de novos clientes.
-        Versão atualizada para websockets 14.1
-        """
-        client_info = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
+        client_ip = self.extract_ip(websocket)
         
         try:
-            # Na versão 14.1 do websockets, os headers estão em websocket.request.headers
             request_headers = getattr(websocket, 'request', None)
             if request_headers:
                 auth_header = request_headers.headers.get('Authorization', '')
             else:
-                # Fallback para a forma antiga de obter os headers
                 auth_header = ''
             
             if not auth_header or not auth_header.startswith('Bearer '):
-                print(f"[{self.get_timestamp()}] Token ausente ou formato inválido de {client_info}")
+                print(f"[{self.get_timestamp()}] Token ausente ou formato inválido de {client_ip}")
                 await websocket.close(1002, reason='Token ausente ou formato inválido')
                 return
                 
             token = auth_header.split('Bearer ')[1].strip()
             
-            # Log do token recebido (apenas para debug)
-            print(f"[{self.get_timestamp()}] Token recebido de {client_info}")
+            print(f"[{self.get_timestamp()}] Token recebido de {client_ip}")
 
             if token != self.AUTH_TOKEN:
-                print(f"[{self.get_timestamp()}] Token inválido de {client_info}")
+                print(f"[{self.get_timestamp()}] Token inválido de {client_ip}")
                 await websocket.close(1002, reason='Token inválido')
                 return
 
-            print(f"[{self.get_timestamp()}] Nova conexão de {client_info} autenticada com sucesso.")
+            print(f"[{self.get_timestamp()}] Nova conexão de {client_ip} autenticada com sucesso.")
             
-            self.clients[client_info] = {
-                'websocket': websocket,
-                'last_ping': time.time()
+            # Se o IP já está conectado, atualizar o websocket
+            if client_ip in self.clients:
+                old_client_id = self.clients[client_ip]['client_id']
+                self.clients[client_ip] = {
+                    'websocket': websocket,
+                    'last_ping': time.time(),
+                    'client_id': old_client_id  # Mantém o mesmo ID
+                }
+                print(f"[{self.get_timestamp()}] Reconexão detectada para {client_ip}")
+
+                # Se este é o cliente prioritário e não está selecionado, selecioná-lo
+                saved_client = load_selected_client()
+                if saved_client == client_ip and self.selected_client != client_ip:
+                    self.selected_client = client_ip
+                    print(f"[{self.get_timestamp()}] Cliente prioritário {client_ip} reconectado e selecionado automaticamente")
+            else:
+                # Novo cliente
+                new_client_id = self.next_client_id
+                self.next_client_id += 1
+                
+                # Se estiver no nível 1 com auto-seleção ativada
+                if self.redundancy_level == 1 and self.auto_select_first:
+                    saved_client = load_selected_client()
+                    
+                    # Se este é o cliente prioritário ou não há cliente selecionado
+                    if saved_client == client_ip:
+                        self.selected_client = client_ip
+                        print(f"[{self.get_timestamp()}] Cliente prioritário {client_ip} conectado e selecionado automaticamente")
+                    elif not self.selected_client:
+                        self.selected_client = client_ip
+                        print(f"[{self.get_timestamp()}] Cliente {client_ip} selecionado automaticamente")
+                
+                self.clients[client_ip] = {
+                    'websocket': websocket,
+                    'last_ping': time.time(),
+                    'client_id': new_client_id
+                }
+
+            # Se este é o cliente prioritário, sempre salvar a seleção
+            saved_client = load_selected_client()
+            if saved_client == client_ip:
+                save_selected_client(client_ip)
+
+            welcome_message = {
+                "type": "welcome",
+                "client_id": self.clients[client_ip]['client_id'],
+                "message": f"Conectado como Cliente #{self.clients[client_ip]['client_id']}"
             }
+            await websocket.send(json.dumps(welcome_message))
 
             try:
                 async for message in websocket:
-                    await self.handle_message(message, client_info)
+                    await self.handle_message(message, client_ip)
             except websockets.exceptions.ConnectionClosed as e:
-                print(f"[{self.get_timestamp()}] Cliente {client_info} desconectado: {e}")
+                print(f"[{self.get_timestamp()}] Cliente {client_ip} desconectado: {e}")
             except Exception as e:
-                print(f"[{self.get_timestamp()}] Erro com cliente {client_info}: {e}")
+                print(f"[{self.get_timestamp()}] Erro com cliente {client_ip}: {e}")
             finally:
-                if client_info in self.clients:
-                    del self.clients[client_info]
-                print(f"[{self.get_timestamp()}] Cliente {client_info} removido da lista de conexões")
+                # Só desconecta se o websocket atual for o mesmo que está registrado
+                if client_ip in self.clients and self.clients[client_ip]['websocket'] == websocket:
+                    await self.handle_client_disconnect(client_ip)
                 
         except Exception as e:
-            print(f"[{self.get_timestamp()}] Erro na autenticação de {client_info}: {e}")
+            print(f"[{self.get_timestamp()}] Erro na autenticação de {client_ip}: {e}")
             await websocket.close(1002, reason='Erro na autenticação')
             return
+
+    def set_redundancy_level(self, level):
+        """Define o nível de redundância do servidor."""
+        if level in [1, 2]:
+            self.redundancy_level = level
+            # Atualizar configuração
+            with open(SERVER_CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+            config["redundancy_level"] = level
+            with open(SERVER_CONFIG_FILE, 'w') as f:
+                json.dump(config, f, indent=4)  # Corrigido
+            
+            print(f"[{self.get_timestamp()}] Nível de redundância alterado para {level}")
+            if level == 1:
+                self.selected_client = None
+                if os.path.exists(SELECTED_CLIENT_FILE):
+                    os.remove(SELECTED_CLIENT_FILE)
+            return True
+        return False
+
+    def select_client(self, client_id):
+        """Seleciona um cliente específico para processamento (apenas para nível 1)."""
+        if self.redundancy_level != 1:
+            print(f"[{self.get_timestamp()}] Seleção de cliente só está disponível no nível 1 de redundância")
+            return False
+
+        for client_ip, client_data in self.clients.items():
+            if client_data['client_id'] == client_id:
+                self.selected_client = client_ip
+                # Salvar o cliente selecionado
+                save_selected_client(client_ip)
+                print(f"[{self.get_timestamp()}] Cliente #{client_id} (IP: {client_ip}) selecionado para processamento")
+                return True
+        
+        print(f"[{self.get_timestamp()}] Cliente #{client_id} não encontrado")
+        return False
+    
+    def show_menu(self):
+        """Exibe o menu de controle de redundância."""
+        print("\n=== Menu de Controle de Redundância ===")
+        print(f"Nível atual: {self.redundancy_level}")
+        print(f"Auto-seleção: {'Ativada' if self.auto_select_first else 'Desativada'}")
+        print("\nOpções:")
+        print("1. Alterar para Nível 1 (Cliente Único)")
+        print("2. Alterar para Nível 2 (Redundância Total)")
+        print("3. Selecionar Cliente Específico")
+        print("4. Listar Clientes Conectados")
+        print("5. Alternar Auto-seleção")
+        print("0. Sair do Menu")
+        print("\nEscolha uma opção: ")
+
+    def handle_menu(self):
+        """Processa as escolhas do menu."""
+        while self.menu_active:
+            self.show_menu()
+            try:
+                choice = input().strip()
+                
+                if choice == "0":
+                    self.menu_active = False
+                    print("Saindo do menu...")
+                
+                elif choice == "1":
+                    self.set_redundancy_level(1)
+                    if self.auto_select_first:
+                        self.select_first_available_client()
+                
+                elif choice == "2":
+                    self.set_redundancy_level(2)
+                
+                elif choice == "3":
+                    if self.redundancy_level == 1:
+                        self.list_clients()
+                        try:
+                            client_id = int(input("\nDigite o ID do cliente para selecionar: "))
+                            self.select_client(client_id)
+                        except ValueError:
+                            print("ID inválido")
+                    else:
+                        print("Seleção de cliente só está disponível no nível 1")
+                
+                elif choice == "4":
+                    self.list_clients()
+                    input("\nPressione Enter para continuar...")
+                
+                elif choice == "5":
+                    self.auto_select_first = not self.auto_select_first
+                    status = "ativada" if self.auto_select_first else "desativada"
+                    print(f"Auto-seleção {status}")
+                    if self.auto_select_first and self.redundancy_level == 1:
+                        self.select_first_available_client()
+                
+                else:
+                    print("Opção inválida!")
+                
+            except Exception as e:
+                print(f"Erro ao processar opção: {e}")
+
+    def select_first_available_client(self):
+        """Seleciona automaticamente o primeiro cliente disponível, priorizando o cliente salvo."""
+        if not self.clients:
+            print("Nenhum cliente disponível para seleção")
+            return False
+
+        saved_client = load_selected_client()
+        
+        # Se existe um cliente salvo e ele está conectado, seleciona ele
+        if saved_client and saved_client in self.clients:
+            self.selected_client = saved_client
+            print(f"[{self.get_timestamp()}] Cliente prioritário #{self.clients[saved_client]['client_id']} selecionado automaticamente")
+            return True
+        
+        # Caso contrário, seleciona o primeiro disponível
+        first_client = list(self.clients.values())[0]
+        self.selected_client = list(self.clients.keys())[0]
+        print(f"[{self.get_timestamp()}] Cliente #{first_client['client_id']} selecionado automaticamente")
+        return True
+
+    def list_clients(self):
+        """Lista todos os clientes conectados com seus IDs."""
+        print(f"\n[{self.get_timestamp()}] Clientes conectados:")
+        for client_ip, client_data in self.clients.items():
+            selected = " (Selecionado)" if client_ip == self.selected_client else ""
+            print(f"Cliente #{client_data['client_id']} - IP: {client_ip}{selected}")
 
     def get_levels(self, data):
         """Calcula o nível de volume do áudio."""
@@ -428,29 +677,46 @@ class AudioServer:
             return audio_bytes  # Retorna o original se falhar
 
     async def send_audio_to_clients(self, audio_bytes):
-        """Envia dados de áudio para todos os clientes conectados."""
+        """Envia dados de áudio para os clientes com base no nível de redundância."""
         wav_data = self.create_wav_from_bytes(audio_bytes)
-        if wav_data:
-            message = {
-                "type": "complete_audio",
-                "timestamp": self.get_timestamp(),
-                "audio_data": base64.b64encode(wav_data).decode('utf-8'),
-                "format": "wav",
-                "duration": len(audio_bytes) / (self.rate * self.channels * 2)  # Duração aproximada
-            }
+        if not wav_data:
+            return
 
-            disconnected_clients = []
-            for client_info, client_data in list(self.clients.items()):
+        message = {
+            "type": "complete_audio",
+            "timestamp": self.get_timestamp(),
+            "audio_data": base64.b64encode(wav_data).decode('utf-8'),
+            "format": "wav",
+            "duration": len(audio_bytes) / (self.rate * self.channels * 2)
+        }
+
+        disconnected_clients = []
+
+        if self.redundancy_level == 2:
+            # Redundância total - enviar para todos os clientes
+            for client_info, client_data in self.clients.items():
                 try:
                     await client_data['websocket'].send(json.dumps(message))
-                    print(f"[{self.get_timestamp()}] Áudio enviado para {client_info}")
+                    print(f"[{self.get_timestamp()}] Áudio enviado para Cliente #{client_data['client_id']}")
                 except Exception as e:
-                    print(f"[{self.get_timestamp()}] Erro ao enviar para {client_info}: {e}")
+                    print(f"[{self.get_timestamp()}] Erro ao enviar para Cliente #{client_data['client_id']}: {e}")
                     disconnected_clients.append(client_info)
 
-            # Remover clientes desconectados
-            for client_info in disconnected_clients:
-                del self.clients[client_info]
+        elif self.redundancy_level == 1:
+            # Redundância seletiva - enviar apenas para o cliente selecionado
+            if self.selected_client and self.selected_client in self.clients:
+                try:
+                    await self.clients[self.selected_client]['websocket'].send(json.dumps(message))
+                    print(f"[{self.get_timestamp()}] Áudio enviado para Cliente #{self.clients[self.selected_client]['client_id']}")
+                except Exception as e:
+                    print(f"[{self.get_timestamp()}] Erro ao enviar para Cliente #{self.clients[self.selected_client]['client_id']}: {e}")
+                    disconnected_clients.append(self.selected_client)
+            else:
+                print(f"[{self.get_timestamp()}] Nenhum cliente selecionado para processamento")
+
+        # Remover clientes desconectados
+        for client_info in disconnected_clients:
+            del self.clients[client_info]
 
     def create_wav_from_bytes(self, audio_bytes):
         """Cria um arquivo WAV a partir de bytes de áudio."""
@@ -477,10 +743,10 @@ class AudioServer:
                 await self.send_audio_to_clients(processed_audio)
 
     def handle_keys(self):
-        """Gerencia entradas de teclado para desligar o servidor e alternar o mute."""
+        """Gerencia entradas de teclado para controle do servidor."""
         def check_keys():
             last_toggle_time = 0
-            toggle_cooldown = 0.5  # Segundos para prevenir alternâncias rápidas
+            toggle_cooldown = 0.5
 
             while self.running:
                 if keyboard.is_pressed('q'):
@@ -494,9 +760,21 @@ class AudioServer:
                         status = "Mutado" if self.muted else "Ativo"
                         print(f"[{self.get_timestamp()}] Estado de mute alterado para: {status}")
                         if self.muted:
-                            self.force_send_event.set()  # Sinaliza para enviar áudio imediatamente
+                            self.force_send_event.set()
                         else:
-                            self.reset_audio_state()  # Reseta o estado de áudio ao desmutar
+                            self.reset_audio_state()
+                        last_toggle_time = current_time
+                elif keyboard.is_pressed('m'):
+                    # Ativar menu de controle
+                    current_time = time.time()
+                    if current_time - last_toggle_time > toggle_cooldown:
+                        if not self.menu_active:
+                            print("\nAbrindo menu de controle...")
+                            self.menu_active = True
+                            # Criar uma nova thread para o menu para não bloquear o servidor
+                            menu_thread = threading.Thread(target=self.handle_menu)
+                            menu_thread.daemon = True
+                            menu_thread.start()
                         last_toggle_time = current_time
                 time.sleep(0.1)
 
@@ -553,18 +831,12 @@ class AudioServer:
             self.cleanup()
 
 if __name__ == "__main__":
+    # Carregar configurações existentes
+    config = load_or_create_configs()
     
-    # Perguntar sobre o tipo de IP
-    ip_version = input("Qual versão do IP deseja usar? (4/6) [4]: ").strip() or "4"
-    use_ipv6 = ip_version == "6"
+    # Criar o servidor com as configurações carregadas
+    server = AudioServer(use_ssl=config["use_ssl"], use_ipv6=config["use_ipv6"])
     
-    # Perguntar sobre SSL
-    use_ssl_input = input("Deseja usar comunicação segura (SSL/TLS)? (y/n): ").strip().lower()
-    use_ssl = use_ssl_input in ['y', 'yes']
-
-    # Criar o servidor com as configurações escolhidas
-    server = AudioServer(use_ssl=use_ssl, use_ipv6=use_ipv6)
-
     try:
         asyncio.run(server.start_server())
     except KeyboardInterrupt:
