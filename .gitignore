@@ -2,3 +2,6 @@
 certs
 versoes_antigas
 versoes_de_teste
+analysis
+project_analyzer.py
+__pycache__
