@@ -104,6 +104,27 @@ To run the client on Google Colab, use the `Whisper.ipynb` script and follow the
 
 ---
 
+## Redundancy Levels
+
+The system supports different levels of redundancy to handle data transmission and processing based on your requirements.
+
+- **Level 1: Single Client**
+  - **Description**: Data is sent to a single client.
+  - **Use Case**: Suitable for environments where only one client is available or desired.
+  - **Configuration**: Set `redundancy_level` to `1` in the configuration file.
+
+- **Level 2: Full Redundancy**
+  - **Description**: Data is sent to all connected clients for redundancy.
+  - **Use Case**: Ideal for ensuring data integrity by sending data to multiple clients.
+  - **Configuration**: Set `redundancy_level` to `2` in the configuration file.
+
+- **Level 3: Redundancy with Load Balancing**
+  - **Description**: Data is sent to clients in a round-robin fashion, balancing the load across multiple clients.
+  - **Use Case**: Recommended for distributed systems where load balancing is necessary.
+  - **Configuration**: Set `redundancy_level` to `3` in the configuration file.
+
+---
+
 ## Dependencies
 
 This project uses Whisper from OpenAI, licensed under the MIT License.

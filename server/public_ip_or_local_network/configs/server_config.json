@@ -1,0 +1,6 @@
+{
+    "redundancy_level": 1,
+    "auto_select_first": true,
+    "use_ipv6": false,
+    "use_ssl": false
+}
