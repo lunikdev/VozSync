@@ -1,0 +1,227 @@
+import asyncio
+import websockets
+import pyaudio
+import wave
+import json
+import base64
+import os
+import io
+from datetime import datetime
+import keyboard
+from dotenv import load_dotenv
+
+class AudioClient:
+    def __init__(self):
+        # Carrega variáveis de ambiente
+        load_dotenv()
+        self.AUTH_TOKEN = os.getenv("AUTH_TOKEN")
+        if not self.AUTH_TOKEN:
+            raise ValueError("AUTH_TOKEN não encontrado no arquivo .env")
+        
+        # Configurações iniciais
+        self.setup_connection()
+        
+        # Configurações de áudio
+        self.chunk_size = 1024
+        self.format = pyaudio.paInt16
+        self.channels = 1
+        self.rate = 16000
+        self.audio = pyaudio.PyAudio()
+        
+        # Estado do cliente
+        self.running = True
+        self.recording = False
+        self.frames = []
+        
+    def setup_connection(self):
+        """Configura a conexão com base nas preferências do usuário."""
+        print("\n=== Configuração de Conexão ===")
+        
+        # Pergunta sobre SSL
+        use_ssl = input("Deseja usar HTTPS? (S/N): ").strip().lower() in ['s', 'sim', 'y', 'yes']
+        self.use_ssl = use_ssl
+        
+        if use_ssl:
+            # Pergunta sobre Let's Encrypt
+            use_le = input("Usar Let's Encrypt? (S/N): ").strip().lower() in ['s', 'sim', 'y', 'yes']
+            
+            if use_le:
+                # Para Let's Encrypt, precisamos de um domínio válido
+                self.host = input("Digite o domínio (ex: exemplo.com): ").strip()
+            else:
+                # Para SSL autoassinado, pode ser IP ou domínio
+                self.host = input("Digite o IP ou domínio (ex: 192.168.1.100 ou exemplo.local): ").strip()
+        else:
+            # Para HTTP, pode ser IP ou domínio
+            self.host = input("Digite o IP ou domínio (ex: 192.168.1.100 ou exemplo.local): ").strip()
+        
+        # Configuração da porta
+        while True:
+            try:
+                port_input = input("Digite a porta (padrão: 9024): ").strip()
+                self.port = int(port_input) if port_input else 9024
+                break
+            except ValueError:
+                print("Porta inválida! Digite um número.")
+        
+        # Configura a URI final
+        self.protocol = "wss" if use_ssl else "ws"
+        self.uri = f"{self.protocol}://{self.host}:{self.port}"
+        
+        print(f"\nConexão configurada: {self.uri}")
+        
+    def get_timestamp(self):
+        """Retorna timestamp formatado."""
+        return datetime.now().strftime("%H:%M:%S")
+        
+    async def connect(self):
+        """Estabelece conexão WebSocket com o servidor."""
+        headers = {"Authorization": f"Bearer {self.AUTH_TOKEN}"}
+        
+        try:
+            async with websockets.connect(
+                self.uri,
+                additional_headers=headers,  # Usando additional_headers para websockets 10.0+
+                ssl=None if not self.use_ssl else True
+            ) as websocket:
+                print(f"[{self.get_timestamp()}] Conectado ao servidor em {self.uri}")
+                
+                # Inicia thread para monitorar teclas
+                self.start_key_monitor()
+                
+                # Processa mensagens recebidas
+                while self.running:
+                    try:
+                        message = await websocket.recv()
+                        await self.handle_message(message)
+                    except websockets.exceptions.ConnectionClosed:
+                        print(f"[{self.get_timestamp()}] Conexão perdida. Tentando reconectar...")
+                        break
+                    except Exception as e:
+                        print(f"[{self.get_timestamp()}] Erro ao processar mensagem: {e}")
+                        
+        except Exception as e:
+            print(f"[{self.get_timestamp()}] Erro de conexão: {e}")
+            
+    def start_key_monitor(self):
+        """Inicia monitoramento de teclas em uma thread separada."""
+        import threading
+        
+        def check_keys():
+            print("\nControles:")
+            print("Mantenha 'R' pressionado para gravar")
+            print("Pressione 'Q' para sair")
+            
+            while self.running:
+                if keyboard.is_pressed('r'):
+                    if not self.recording:
+                        self.start_recording()
+                elif self.recording:
+                    self.stop_recording()
+                    
+                if keyboard.is_pressed('q'):
+                    self.running = False
+                    break
+                    
+        key_thread = threading.Thread(target=check_keys)
+        key_thread.daemon = True
+        key_thread.start()
+        
+    def start_recording(self):
+        """Inicia gravação de áudio."""
+        self.recording = True
+        self.frames = []
+        print(f"\n[{self.get_timestamp()}] Gravando... (solte R para parar)")
+        
+        self.stream = self.audio.open(
+            format=self.format,
+            channels=self.channels,
+            rate=self.rate,
+            input=True,
+            frames_per_buffer=self.chunk_size
+        )
+        
+    def stop_recording(self):
+        """Para gravação e processa o áudio."""
+        if not self.recording:
+            return
+            
+        self.recording = False
+        self.stream.stop_stream()
+        self.stream.close()
+        
+        print(f"[{self.get_timestamp()}] Gravação finalizada")
+        
+        # Cria arquivo WAV em memória
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, 'wb') as wf:
+            wf.setnchannels(self.channels)
+            wf.setsampwidth(self.audio.get_sample_size(self.format))
+            wf.setframerate(self.rate)
+            wf.writeframes(b''.join(self.frames))
+            
+        # Envia áudio para o servidor
+        asyncio.create_task(self.send_audio(wav_buffer.getvalue()))
+        
+    async def send_audio(self, wav_data):
+        """Envia áudio para o servidor."""
+        try:
+            message = {
+                "type": "audio",
+                "timestamp": self.get_timestamp(),
+                "audio_data": base64.b64encode(wav_data).decode('utf-8'),
+                "format": "wav"
+            }
+            
+            async with websockets.connect(
+                self.uri,
+                additional_headers={"Authorization": f"Bearer {self.AUTH_TOKEN}"},  # Usando additional_headers
+                ssl=None if not self.use_ssl else True
+            ) as ws:
+                await ws.send(json.dumps(message))
+                print(f"[{self.get_timestamp()}] Áudio enviado para o servidor")
+                
+        except Exception as e:
+            print(f"[{self.get_timestamp()}] Erro ao enviar áudio: {e}")
+            
+    async def handle_message(self, message):
+        """Processa mensagens recebidas do servidor."""
+        try:
+            data = json.loads(message)
+            message_type = data.get("type", "unknown")
+            
+            if message_type == "welcome":
+                print(f"\n[{self.get_timestamp()}] {data['message']}")
+            elif message_type == "transcription":
+                print(f"\n[{self.get_timestamp()}] Transcrição recebida: {data['text']}")
+            else:
+                print(f"[{self.get_timestamp()}] Mensagem desconhecida recebida: {message_type}")
+                
+        except json.JSONDecodeError:
+            print(f"[{self.get_timestamp()}] Erro ao decodificar mensagem")
+        except Exception as e:
+            print(f"[{self.get_timestamp()}] Erro ao processar mensagem: {e}")
+            
+    def cleanup(self):
+        """Limpa recursos do cliente."""
+        if hasattr(self, 'stream'):
+            try:
+                self.stream.stop_stream()
+                self.stream.close()
+            except:
+                pass
+        if self.audio:
+            self.audio.terminate()
+        print(f"[{self.get_timestamp()}] Cliente finalizado")
+
+if __name__ == "__main__":
+    client = AudioClient()
+    
+    try:
+        asyncio.run(client.connect())
+    except KeyboardInterrupt:
+        print("\nEncerrando cliente...")
+    except Exception as e:
+        print(f"Erro: {e}")
+    finally:
+        client.cleanup()

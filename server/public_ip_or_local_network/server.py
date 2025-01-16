@@ -1,4 +1,5 @@
 # server.py
+
 import asyncio
 import websockets
 import os
@@ -10,6 +11,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import keyboard
 import socket
+
 from configs.modules.ssl_manager import SSLManager
 from configs.modules.config_manager import ConfigManager
 from configs.modules.audio_processor import AudioProcessor
@@ -225,7 +227,7 @@ class AudioServer:
                 await self.send_audio_to_clients(processed_audio)
 
     def show_menu(self):
-        """Exibe o menu de controle."""
+        """Exibe o menu de controle de redundância."""
         print("\n=== Menu de Controle de Redundância ===")
         print(f"Nível atual: {self.client_manager.redundancy_level}")
         print(f"Auto-seleção: {'Ativada' if self.client_manager.auto_select_first else 'Desativada'}")
@@ -277,12 +279,11 @@ class AudioServer:
                         self.client_manager.select_first_available_client()
                 else:
                     print("Opção inválida!")
-
             except Exception as e:
                 print(f"Erro ao processar opção: {e}")
 
     def handle_keys(self):
-        """Gerencia entradas de teclado."""
+        """Gerencia entradas de teclado (para desligar, mutar, etc.)."""
         def check_keys():
             last_toggle_time = 0
             toggle_cooldown = 0.5
@@ -320,12 +321,12 @@ class AudioServer:
         keyboard_thread.start()
 
     def cleanup(self):
-        """Limpa recursos do servidor."""
+        """Limpa recursos do servidor antes de sair."""
         self.audio_processor.cleanup()
         print(f"[{self.get_timestamp()}] Desligamento do servidor completo.")
 
     async def start_server(self):
-        """Inicia o servidor."""
+        """Inicia o servidor WebSocket."""
         self.handle_keys()
 
         try:
@@ -367,9 +368,42 @@ class AudioServer:
             self.cleanup()
 
 if __name__ == "__main__":
+    from configs.modules.letsencrypt_manager import LetsEncryptManager
+
     config_manager = ConfigManager()
     config = config_manager.load_or_create_configs()
-    
+
+    if config["use_ssl"]:
+        if config.get("use_lets_encrypt", False):
+            print("[MAIN] Modo HTTPS (produção) com Let's Encrypt habilitado.")
+
+            # Verifica se já existem server.crt / server.key em 'certs/letsencrypt/'
+            le_server_crt = os.path.join("certs", "letsencrypt", "server.crt")
+            le_server_key = os.path.join("certs", "letsencrypt", "server.key")
+
+            if not (os.path.exists(le_server_crt) and os.path.exists(le_server_key)):
+                # Se não existir, pergunta ao usuário se deseja gerar agora
+                choice_generate = input("Certificados LE não encontrados. Deseja gerar agora? (S/N): ").strip().lower()
+                if choice_generate in ['s', 'sim', 'y', 'yes']:
+                    lem = LetsEncryptManager()
+                    success = lem.setup_letsencrypt()
+                    if not success:
+                        print("[MAIN] Falha na criação de certificados Let’s Encrypt. Voltando para autoassinado.")
+                        config["use_lets_encrypt"] = False
+                        # Se quiser, pode forçar a atualização do server_config.json
+                        config_manager.update_config("use_lets_encrypt", False)
+                else:
+                    print("[MAIN] O usuário optou por não gerar LE. Voltando para autoassinado.")
+                    config["use_lets_encrypt"] = False
+                    config_manager.update_config("use_lets_encrypt", False)
+            else:
+                print("[MAIN] Certificados Let's Encrypt já existem na pasta certs/letsencrypt/.")
+        else:
+            print("[MAIN] Modo HTTPS (desenvolvimento) com certificados autoassinados.")
+    else:
+        print("[MAIN] Modo HTTP (sem SSL).")
+
+    # Agora instancia o servidor com base no config atualizado
     server = AudioServer(use_ssl=config["use_ssl"], use_ipv6=config["use_ipv6"])
     
     try:
