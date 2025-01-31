@@ -47,6 +47,7 @@ class ClientManager:
         except Exception as e:
             print(f"[{self.get_timestamp()}] Erro ao desconectar cliente {client_info}: {e}")
 
+
     async def add_client(self, websocket, client_ip, client_type='processing'):
         if client_ip in self.clients:
             old_client_id = self.clients[client_ip]['client_id']
