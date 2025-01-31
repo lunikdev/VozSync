@@ -1,5 +1,3 @@
-# client.py
-
 import asyncio
 import websockets
 import ssl
@@ -149,6 +147,7 @@ class AudioClient:
         try:
             # Decodifica o áudio
             audio_data = base64.b64decode(audio_data_b64)
+            audio_uuid = message_info.get('audio_uuid', None)  # Recebe o UUID do áudio
             message_type = message_info.get('type', 'chunk')
 
             # Se for um chunk de áudio contínuo
@@ -248,7 +247,8 @@ class AudioClient:
                                     {
                                         'type': data.get('type', 'chunk'),
                                         'timestamp': data.get('timestamp'),
-                                        'duration': data.get('duration', 0)
+                                        'duration': data.get('duration', 0),
+                                        'audio_uuid': data.get('audio_uuid', '')  # Recebe o UUID do áudio
                                     }
                                 )
                             except json.JSONDecodeError as e:
@@ -278,6 +278,7 @@ class AudioClient:
     async def handle_incoming_messages(self):
         """Opcional: Lida com mensagens recebidas do servidor, se necessário"""
         pass
+
 
 def get_server_ip(use_ipv6):
     """Solicita ao usuário que insira o IP do servidor com suporte a IPv6."""
@@ -420,5 +421,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nFechando conexão...")
+        print("\nFechando conexão...") 
         sys.exit()

@@ -1,5 +1,3 @@
-# server.py
-
 import asyncio
 import websockets
 import os
@@ -8,6 +6,7 @@ import base64
 import threading
 import time
 from datetime import datetime
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 import keyboard
 import socket
@@ -60,7 +59,7 @@ class AudioServer:
             request_headers = getattr(websocket, 'request', None)
             if request_headers:
                 auth_header = request_headers.headers.get('Authorization', '')
-                client_type = request_headers.headers.get('Client-Type', 'processing')  # Default como processamento
+                client_type = request_headers.headers.get('Client-Type', 'processing')
             else:
                 auth_header = ''
                 client_type = 'processing'
@@ -85,12 +84,21 @@ class AudioServer:
             if client_type == 'final':
                 # Para clientes finais, apenas receba mensagens e encaminhe áudio
                 async for message in websocket:
-                    data = json.loads(message)
-                    if data.get('type') == 'audio':
-                        # Encaminhar áudio para processamento
-                        await self.send_audio_to_clients(base64.b64decode(data['audio_data']))
+                    try:
+                        data = json.loads(message)
+                        if data.get('type') == 'audio':
+                            # Gerar UUID único para cada áudio
+                            audio_uuid = str(uuid.uuid4())
+                            data['audio_uuid'] = audio_uuid
+                            print(f"[{self.get_timestamp()}] Novo áudio recebido do cliente final. UUID: {audio_uuid}")
+                            # Encaminhar áudio para processamento
+                            await self.send_audio_to_clients(base64.b64decode(data['audio_data']), audio_uuid)
+                    except json.JSONDecodeError:
+                        print(f"[{self.get_timestamp()}] Erro ao decodificar mensagem do cliente final")
+                    except Exception as e:
+                        print(f"[{self.get_timestamp()}] Erro ao processar mensagem do cliente final: {str(e)}")
             else:
-                # Para clientes de processamento, continue com o comportamento atual
+                # Para clientes de processamento
                 async for message in websocket:
                     await self.handle_message(message, client_ip)
 
@@ -107,12 +115,18 @@ class AudioServer:
 
             if message_type == "transcription":
                 transcription = data.get("text", "")
+                audio_uuid = data.get("audio_uuid")
                 timestamp = data.get("timestamp", self.get_timestamp())
                 client_id = self.client_manager.get_client_id(client_info)
-                print(f"[{timestamp}] Transcrição recebida de Cliente #{client_id}: {transcription}")
+                
+                print(f"[{timestamp}] Transcrição recebida de Cliente #{client_id}")
+                print(f"UUID: {audio_uuid}")
+                print(f"Texto: {transcription}")
 
-                if self.client_manager.redundancy_level == 3:
-                    print(f"[{self.get_timestamp()}] Processamento balanceado - Cliente #{client_id}")
+                if audio_uuid:
+                    await self.send_transcription_to_final_client(audio_uuid, transcription)
+                else:
+                    print(f"[{timestamp}] AVISO: Transcrição recebida sem UUID")
             else:
                 print(f"[{self.get_timestamp()}] Tipo de mensagem desconhecido de {client_info}: {message_type}")
 
@@ -120,6 +134,79 @@ class AudioServer:
             print(f"[{self.get_timestamp()}] Erro ao decodificar mensagem de {client_info}: {e}")
         except Exception as e:
             print(f"[{self.get_timestamp()}] Erro ao processar mensagem de {client_info}: {e}")
+
+    async def send_audio_to_clients(self, audio_bytes, audio_uuid):
+        """Envia dados de áudio para os clientes de processamento."""
+        wav_data = self.audio_processor.create_wav_from_bytes(audio_bytes)
+        if not wav_data:
+            print(f"[{self.get_timestamp()}] Erro: Dados WAV inválidos para UUID {audio_uuid}")
+            return
+
+        message = {
+            "type": "complete_audio",
+            "timestamp": self.get_timestamp(),
+            "audio_data": base64.b64encode(wav_data).decode('utf-8'),
+            "audio_uuid": audio_uuid,
+            "format": "wav",
+            "duration": len(audio_bytes) / (self.audio_processor.rate * self.audio_processor.channels * 2)
+        }
+
+        message_str = json.dumps(message)
+        sent_successfully = False
+
+        if self.client_manager.redundancy_level == 3:
+            next_client = self.client_manager.get_next_round_robin_client()
+            if next_client:
+                client_info, client_data = next_client
+                if await self.client_manager.send_to_client(client_info, message_str):
+                    sent_successfully = True
+                else:
+                    await self.client_manager.handle_client_disconnect(client_info)
+        
+        elif self.client_manager.redundancy_level == 2:
+            for client_ip in list(self.client_manager.clients.keys()):
+                if await self.client_manager.send_to_client(client_ip, message_str):
+                    sent_successfully = True
+                else:
+                    await self.client_manager.handle_client_disconnect(client_ip)
+        
+        elif self.client_manager.redundancy_level == 1:
+            if self.client_manager.selected_client:
+                if await self.client_manager.send_to_client(self.client_manager.selected_client, message_str):
+                    sent_successfully = True
+                else:
+                    await self.client_manager.handle_client_disconnect(self.client_manager.selected_client)
+
+        if sent_successfully:
+            print(f"[{self.get_timestamp()}] Áudio UUID {audio_uuid} enviado para processamento")
+        else:
+            print(f"[{self.get_timestamp()}] Não foi possível enviar o áudio UUID {audio_uuid} para processamento")
+
+    async def send_transcription_to_final_client(self, audio_uuid, transcription):
+        """Envia a transcrição de volta para o cliente final com o UUID."""
+        final_clients_found = False
+        for client_ip, client_data in self.client_manager.clients.items():
+            if client_data['type'] == 'final':
+                final_clients_found = True
+                message = {
+                    "type": "transcription",
+                    "timestamp": self.get_timestamp(),
+                    "text": transcription,
+                    "audio_uuid": audio_uuid
+                }
+                try:
+                    success = await self.client_manager.send_to_client(client_ip, json.dumps(message))
+                    if success:
+                        print(f"[{self.get_timestamp()}] Transcrição enviada para o cliente final")
+                        print(f"UUID: {audio_uuid}")
+                        print(f"Texto: {transcription}")
+                    else:
+                        print(f"[{self.get_timestamp()}] Falha ao enviar transcrição para o cliente final")
+                except Exception as e:
+                    print(f"[{self.get_timestamp()}] Erro ao enviar transcrição para o cliente final: {e}")
+
+        if not final_clients_found:
+            print(f"[{self.get_timestamp()}] Nenhum cliente final encontrado para receber a transcrição")
 
     async def broadcast_audio(self):
         """Transmite áudio para os clientes."""
@@ -139,9 +226,7 @@ class AudioServer:
                         if not data:
                             continue
 
-                        pegel = self.audio_processor.get_levels(data)
                         self.audio_processor.add_to_buffer(data)
-
                         voice_threshold = self.audio_processor.long_term_noise_level + 300
 
                         if self.audio_processor.voice_activity_detected:
@@ -149,10 +234,10 @@ class AudioServer:
                             if self.audio_processor.current_noise_level < self.audio_processor.ambient_noise_level + 100:
                                 audio_bytes = self.audio_processor.get_frames_as_bytes()
                                 if len(audio_bytes) > 0:
-                                    print(f"[{self.get_timestamp()}] Segmento de fala finalizado, enviando para os clientes.")
+                                    print(f"[{self.get_timestamp()}] Segmento de fala finalizado")
+                                    audio_uuid = str(uuid.uuid4())
                                     processed_audio = self.audio_processor.process_audio(audio_bytes)
-                                    await self.send_audio_to_clients(processed_audio)
-                                    
+                                    await self.send_audio_to_clients(processed_audio, audio_uuid)
                                 self.audio_processor.reset_audio_state()
                         else:
                             if self.audio_processor.current_noise_level > voice_threshold:
@@ -170,10 +255,10 @@ class AudioServer:
                 if self.force_send_event.is_set():
                     audio_bytes = self.audio_processor.get_frames_as_bytes()
                     if audio_bytes:
-                        print(f"[{self.get_timestamp()}] Forçando envio do áudio devido ao mute.")
+                        print(f"[{self.get_timestamp()}] Forçando envio do áudio devido ao mute")
                         processed_audio = self.audio_processor.process_audio(audio_bytes)
-                        await self.send_audio_to_clients(processed_audio)
-
+                        audio_uuid = str(uuid.uuid4())
+                        await self.send_audio_to_clients(processed_audio, audio_uuid)
                     self.audio_processor.reset_audio_state()
                     self.force_send_event.clear()
 
@@ -185,50 +270,7 @@ class AudioServer:
                 stream.close()
             except Exception as e:
                 print(f"[{self.get_timestamp()}] Erro ao fechar stream: {e}")
-            print(f"[{self.get_timestamp()}] Captura de áudio parada.")
-            await self.send_complete_audio()
-
-    async def send_audio_to_clients(self, audio_bytes):
-        """Envia dados de áudio para os clientes."""
-        wav_data = self.audio_processor.create_wav_from_bytes(audio_bytes)
-        if not wav_data:
-            return
-
-        message = {
-            "type": "complete_audio",
-            "timestamp": self.get_timestamp(),
-            "audio_data": base64.b64encode(wav_data).decode('utf-8'),
-            "format": "wav",
-            "duration": len(audio_bytes) / (self.audio_processor.rate * self.audio_processor.channels * 2)
-        }
-
-        message_str = json.dumps(message)
-
-        if self.client_manager.redundancy_level == 3:
-            next_client = self.client_manager.get_next_round_robin_client()
-            if next_client:
-                client_info, client_data = next_client
-                if not await self.client_manager.send_to_client(client_info, message_str):
-                    await self.client_manager.handle_client_disconnect(client_info)
-        
-        elif self.client_manager.redundancy_level == 2:
-            for client_ip in list(self.client_manager.clients.keys()):
-                if not await self.client_manager.send_to_client(client_ip, message_str):
-                    await self.client_manager.handle_client_disconnect(client_ip)
-        
-        elif self.client_manager.redundancy_level == 1:
-            if self.client_manager.selected_client:
-                if not await self.client_manager.send_to_client(self.client_manager.selected_client, message_str):
-                    await self.client_manager.handle_client_disconnect(self.client_manager.selected_client)
-
-    async def send_complete_audio(self):
-        """Envia qualquer áudio restante no buffer."""
-        if self.audio_processor.frames:
-            audio_bytes = self.audio_processor.get_frames_as_bytes()
-            if len(audio_bytes) > 0:
-                print(f"[{self.get_timestamp()}] Enviando segmento final de áudio.")
-                processed_audio = self.audio_processor.process_audio(audio_bytes)
-                await self.send_audio_to_clients(processed_audio)
+            print(f"[{self.get_timestamp()}] Captura de áudio parada")
 
     def show_menu(self):
         """Exibe o menu de controle de redundância."""
@@ -362,6 +404,7 @@ class AudioServer:
                 print(f"[{self.get_timestamp()}] Servidor {ip_version} iniciado em {protocolo}://{self.host}:{self.port}")
                 print(f"[{self.get_timestamp()}] Pressione 'q' para desligar o servidor.")
                 print(f"[{self.get_timestamp()}] Pressione 'k' para alternar o mute do microfone.")
+                print(f"[{self.get_timestamp()}] Pressione 'm' para abrir o menu de controle.")
 
                 broadcast_task = asyncio.create_task(self.broadcast_audio())
                 await asyncio.gather(server.wait_closed(), broadcast_task)
@@ -392,9 +435,8 @@ if __name__ == "__main__":
                     lem = LetsEncryptManager()
                     success = lem.setup_letsencrypt()
                     if not success:
-                        print("[MAIN] Falha na criação de certificados Let’s Encrypt. Voltando para autoassinado.")
+                        print("[MAIN] Falha na criação de certificados Let's Encrypt. Voltando para autoassinado.")
                         config["use_lets_encrypt"] = False
-                        # Se quiser, pode forçar a atualização do server_config.json
                         config_manager.update_config("use_lets_encrypt", False)
                 else:
                     print("[MAIN] O usuário optou por não gerar LE. Voltando para autoassinado.")

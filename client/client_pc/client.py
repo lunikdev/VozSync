@@ -1,3 +1,5 @@
+#client.py cliente final que envia o audio e tem que receber a transcrição
+
 import asyncio
 import websockets
 import pyaudio
@@ -216,18 +218,21 @@ class AudioClient:
             )
             
     async def handle_message(self, message):
-        """Processa mensagens recebidas do servidor."""
         try:
             data = json.loads(message)
             message_type = data.get("type", "unknown")
             
             if message_type == "welcome":
-                print(f"\n[{self.get_timestamp()}] {data['message']}")
+                print(f"[{self.get_timestamp()}] {data['message']}")
             elif message_type == "transcription":
-                print(f"\n[{self.get_timestamp()}] Transcrição recebida: {data['text']}")
+                transcription = data.get("text", "")
+                audio_uuid = data.get("audio_uuid", "")
+                if transcription:
+                    print(f"[{self.get_timestamp()}] Transcrição recebida (UUID: {audio_uuid}): {transcription}")
+                else:
+                    print(f"[{self.get_timestamp()}] Transcrição vazia recebida para UUID: {audio_uuid}")
             else:
                 print(f"[{self.get_timestamp()}] Mensagem desconhecida recebida: {message_type}")
-                
         except json.JSONDecodeError:
             print(f"[{self.get_timestamp()}] Erro ao decodificar mensagem")
         except Exception as e:
