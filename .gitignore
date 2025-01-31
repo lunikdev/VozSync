@@ -7,3 +7,4 @@ project_analyzer.py
 __pycache__
 ver.py
 server_config.json
+client2.py

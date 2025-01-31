@@ -47,26 +47,21 @@ class ClientManager:
         except Exception as e:
             print(f"[{self.get_timestamp()}] Erro ao desconectar cliente {client_info}: {e}")
 
-    async def add_client(self, websocket, client_ip):
-        """Adiciona ou atualiza um cliente."""
+    async def add_client(self, websocket, client_ip, client_type='processing'):
         if client_ip in self.clients:
             old_client_id = self.clients[client_ip]['client_id']
             self.clients[client_ip] = {
                 'websocket': websocket,
                 'last_ping': time.time(),
-                'client_id': old_client_id
+                'client_id': old_client_id,
+                'type': client_type
             }
-            print(f"[{self.get_timestamp()}] Reconexão detectada para {client_ip}")
-
-            saved_client = self.config_manager.load_selected_client()
-            if saved_client == client_ip and self.selected_client != client_ip:
-                self.selected_client = client_ip
-                print(f"[{self.get_timestamp()}] Cliente prioritário {client_ip} reconectado e selecionado automaticamente")
+            print(f"[{self.get_timestamp()}] Reconexão detectada para {client_ip} ({client_type})")
         else:
             new_client_id = self.next_client_id
             self.next_client_id += 1
             
-            if self.redundancy_level == 1 and self.auto_select_first:
+            if client_type == 'processing' and self.redundancy_level == 1 and self.auto_select_first:
                 saved_client = self.config_manager.load_selected_client()
                 
                 if saved_client == client_ip:
@@ -79,16 +74,14 @@ class ClientManager:
             self.clients[client_ip] = {
                 'websocket': websocket,
                 'last_ping': time.time(),
-                'client_id': new_client_id
+                'client_id': new_client_id,
+                'type': client_type
             }
-
-        saved_client = self.config_manager.load_selected_client()
-        if saved_client == client_ip:
-            self.config_manager.save_selected_client(client_ip)
 
         welcome_message = {
             "type": "welcome",
             "client_id": self.clients[client_ip]['client_id'],
+            "client_type": client_type,
             "message": f"Conectado como Cliente #{self.clients[client_ip]['client_id']}"
         }
         await websocket.send(json.dumps(welcome_message))

@@ -33,6 +33,10 @@ class AudioClient:
         self.recording = False
         self.frames = []
         
+        # Fila para áudio e loop de eventos
+        self.audio_queue = None
+        self.event_loop = None
+        
     def setup_connection(self):
         """Configura a conexão com base nas preferências do usuário."""
         print("\n=== Configuração de Conexão ===")
@@ -76,12 +80,18 @@ class AudioClient:
         
     async def connect(self):
         """Estabelece conexão WebSocket com o servidor."""
-        headers = {"Authorization": f"Bearer {self.AUTH_TOKEN}"}
+        self.audio_queue = asyncio.Queue()
+        self.event_loop = asyncio.get_event_loop()
+        
+        headers = {
+            "Authorization": f"Bearer {self.AUTH_TOKEN}",
+            "Client-Type": "final"  # Identifica como cliente final
+        }
         
         try:
             async with websockets.connect(
                 self.uri,
-                additional_headers=headers,  # Usando additional_headers para websockets 10.0+
+                additional_headers=headers,
                 ssl=None if not self.use_ssl else True
             ) as websocket:
                 print(f"[{self.get_timestamp()}] Conectado ao servidor em {self.uri}")
@@ -89,19 +99,37 @@ class AudioClient:
                 # Inicia thread para monitorar teclas
                 self.start_key_monitor()
                 
+                # Inicia tarefa para processar a fila de áudio
+                audio_task = asyncio.create_task(self.process_audio_queue(websocket))
+                
                 # Processa mensagens recebidas
-                while self.running:
-                    try:
+                try:
+                    while self.running:
                         message = await websocket.recv()
                         await self.handle_message(message)
-                    except websockets.exceptions.ConnectionClosed:
-                        print(f"[{self.get_timestamp()}] Conexão perdida. Tentando reconectar...")
-                        break
-                    except Exception as e:
-                        print(f"[{self.get_timestamp()}] Erro ao processar mensagem: {e}")
+                except websockets.exceptions.ConnectionClosed:
+                    print(f"[{self.get_timestamp()}] Conexão perdida. Tentando reconectar...")
+                finally:
+                    audio_task.cancel()
                         
         except Exception as e:
             print(f"[{self.get_timestamp()}] Erro de conexão: {e}")
+            
+    async def process_audio_queue(self, websocket):
+        """Processa a fila de áudio assincronamente."""
+        while True:
+            try:
+                wav_data = await self.audio_queue.get()
+                message = {
+                    "type": "audio",
+                    "timestamp": self.get_timestamp(),
+                    "audio_data": base64.b64encode(wav_data).decode('utf-8'),
+                    "format": "wav"
+                }
+                await websocket.send(json.dumps(message))
+                print(f"[{self.get_timestamp()}] Áudio enviado para o servidor")
+            except Exception as e:
+                print(f"[{self.get_timestamp()}] Erro ao enviar áudio: {e}")
             
     def start_key_monitor(self):
         """Inicia monitoramento de teclas em uma thread separada."""
@@ -141,6 +169,21 @@ class AudioClient:
             frames_per_buffer=self.chunk_size
         )
         
+        # Inicia captura de áudio em uma thread separada
+        def capture_audio():
+            while self.recording:
+                try:
+                    data = self.stream.read(self.chunk_size, exception_on_overflow=False)
+                    self.frames.append(data)
+                except Exception as e:
+                    print(f"[{self.get_timestamp()}] Erro na captura de áudio: {e}")
+                    break
+        
+        import threading
+        audio_thread = threading.Thread(target=capture_audio)
+        audio_thread.daemon = True
+        audio_thread.start()
+        
     def stop_recording(self):
         """Para gravação e processa o áudio."""
         if not self.recording:
@@ -152,6 +195,10 @@ class AudioClient:
         
         print(f"[{self.get_timestamp()}] Gravação finalizada")
         
+        if not self.frames:
+            print(f"[{self.get_timestamp()}] Nenhum áudio capturado")
+            return
+            
         # Cria arquivo WAV em memória
         wav_buffer = io.BytesIO()
         with wave.open(wav_buffer, 'wb') as wf:
@@ -159,30 +206,14 @@ class AudioClient:
             wf.setsampwidth(self.audio.get_sample_size(self.format))
             wf.setframerate(self.rate)
             wf.writeframes(b''.join(self.frames))
-            
-        # Envia áudio para o servidor
-        asyncio.create_task(self.send_audio(wav_buffer.getvalue()))
         
-    async def send_audio(self, wav_data):
-        """Envia áudio para o servidor."""
-        try:
-            message = {
-                "type": "audio",
-                "timestamp": self.get_timestamp(),
-                "audio_data": base64.b64encode(wav_data).decode('utf-8'),
-                "format": "wav"
-            }
-            
-            async with websockets.connect(
-                self.uri,
-                additional_headers={"Authorization": f"Bearer {self.AUTH_TOKEN}"},  # Usando additional_headers
-                ssl=None if not self.use_ssl else True
-            ) as ws:
-                await ws.send(json.dumps(message))
-                print(f"[{self.get_timestamp()}] Áudio enviado para o servidor")
-                
-        except Exception as e:
-            print(f"[{self.get_timestamp()}] Erro ao enviar áudio: {e}")
+        # Coloca o áudio na fila para processamento assíncrono
+        if self.event_loop and self.audio_queue:
+            self.event_loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(
+                    self.audio_queue.put(wav_buffer.getvalue())
+                )
+            )
             
     async def handle_message(self, message):
         """Processa mensagens recebidas do servidor."""

@@ -60,8 +60,10 @@ class AudioServer:
             request_headers = getattr(websocket, 'request', None)
             if request_headers:
                 auth_header = request_headers.headers.get('Authorization', '')
+                client_type = request_headers.headers.get('Client-Type', 'processing')  # Default como processamento
             else:
                 auth_header = ''
+                client_type = 'processing'
             
             if not auth_header or not auth_header.startswith('Bearer '):
                 print(f"[{self.get_timestamp()}] Token ausente ou formato inválido de {client_ip}")
@@ -75,21 +77,23 @@ class AudioServer:
                 await websocket.close(1002, reason='Token inválido')
                 return
 
-            print(f"[{self.get_timestamp()}] Nova conexão de {client_ip} autenticada com sucesso.")
+            print(f"[{self.get_timestamp()}] Nova conexão de {client_ip} ({client_type}) autenticada com sucesso.")
             
-            # Registrar cliente
-            await self.client_manager.add_client(websocket, client_ip)
+            # Registrar cliente com seu tipo
+            await self.client_manager.add_client(websocket, client_ip, client_type)
 
-            try:
+            if client_type == 'final':
+                # Para clientes finais, apenas receba mensagens e encaminhe áudio
+                async for message in websocket:
+                    data = json.loads(message)
+                    if data.get('type') == 'audio':
+                        # Encaminhar áudio para processamento
+                        await self.send_audio_to_clients(base64.b64decode(data['audio_data']))
+            else:
+                # Para clientes de processamento, continue com o comportamento atual
                 async for message in websocket:
                     await self.handle_message(message, client_ip)
-            except websockets.exceptions.ConnectionClosed as e:
-                print(f"[{self.get_timestamp()}] Cliente {client_ip} desconectado: {e}")
-            except Exception as e:
-                print(f"[{self.get_timestamp()}] Erro com cliente {client_ip}: {e}")
-            finally:
-                await self.client_manager.handle_client_disconnect(client_ip)
-                
+
         except Exception as e:
             print(f"[{self.get_timestamp()}] Erro na autenticação de {client_ip}: {e}")
             await websocket.close(1002, reason='Erro na autenticação')
