@@ -54,74 +54,58 @@ class AudioServer:
         return datetime.now().strftime("%H:%M:%S")
 
     async def register(self, websocket):
-        """Registra um novo cliente ou reconecta um cliente existente."""
-        client_ip = self.client_manager.extract_ip(websocket)
-        
-        try:
-            # Verificar autenticação
-            request_headers = getattr(websocket, 'request', None)
-            if request_headers:
-                auth_header = request_headers.headers.get('Authorization', '')
-                client_type = request_headers.headers.get('Client-Type', 'processing')
-            else:
-                auth_header = ''
-                client_type = 'processing'
+            """Registra um novo cliente ou reconecta um cliente existente."""
+            client_ip = self.client_manager.extract_ip(websocket)
             
-            if not auth_header or not auth_header.startswith('Bearer '):
-                print(f"[{self.get_timestamp()}] Token ausente ou formato inválido de {client_ip}")
-                await websocket.close(1002, reason='Token ausente ou formato inválido')
-                return
+            try:
+                # Verificar autenticação
+                request_headers = getattr(websocket, 'request', None)
+                if request_headers:
+                    auth_header = request_headers.headers.get('Authorization', '')
+                    client_type = request_headers.headers.get('Client-Type', 'processing')
+                else:
+                    auth_header = ''
+                    client_type = 'processing'
                 
-            token = auth_header.split('Bearer ')[1].strip()
-            
-            if token != self.AUTH_TOKEN:
-                print(f"[{self.get_timestamp()}] Token inválido de {client_ip}")
-                await websocket.close(1002, reason='Token inválido')
-                return
+                if not auth_header or not auth_header.startswith('Bearer '):
+                    print(f"[{self.get_timestamp()}] Token ausente ou formato inválido de {client_ip}")
+                    await websocket.close(1002, reason='Token ausente ou formato inválido')
+                    return
+                    
+                token = auth_header.split('Bearer ')[1].strip()
+                
+                if token != self.AUTH_TOKEN:
+                    print(f"[{self.get_timestamp()}] Token inválido de {client_ip}")
+                    await websocket.close(1002, reason='Token inválido')
+                    return
 
-            # Verifica se é uma reconexão
-            is_reconnection = client_ip in self.client_manager.clients
-            if is_reconnection:
-                print(f"[{self.get_timestamp()}] Reconexão detectada para {client_ip} ({client_type})")
-            else:
-                print(f"[{self.get_timestamp()}] Nova conexão de {client_ip} ({client_type}) autenticada com sucesso.")
-            
-            # Registrar cliente com seu tipo
-            await self.client_manager.add_client(websocket, client_ip, client_type)
+                # Registrar cliente com seu tipo
+                await self.client_manager.add_client(websocket, client_ip, client_type)
 
-            # Envia mensagem de boas-vindas sem gerar aviso de UUID
-            welcome_message = {
-                "type": "welcome",
-                "client_id": self.client_manager.get_client_id(client_ip),
-                "client_type": client_type,
-                "message": f"Conectado como Cliente #{self.client_manager.get_client_id(client_ip)}"
-            }
-            await websocket.send(json.dumps(welcome_message))
+                if client_type == 'final':
+                    # Para clientes finais
+                    async for message in websocket:
+                        try:
+                            data = json.loads(message)
+                            if data.get('type') == 'audio':
+                                audio_uuid = str(uuid.uuid4())
+                                print(f"[{self.get_timestamp()}] Novo áudio recebido do cliente final. UUID: {audio_uuid}")
+                                await self.send_audio_to_clients(base64.b64decode(data['audio_data']), audio_uuid)
+                        except json.JSONDecodeError:
+                            print(f"[{self.get_timestamp()}] Erro ao decodificar mensagem do cliente final")
+                        except Exception as e:
+                            print(f"[{self.get_timestamp()}] Erro ao processar mensagem do cliente final: {str(e)}")
+                else:
+                    # Para clientes de processamento
+                    async for message in websocket:
+                        await self.handle_message(message, client_ip)
 
-            if client_type == 'final':
-                # Para clientes finais
-                async for message in websocket:
-                    try:
-                        data = json.loads(message)
-                        if data.get('type') == 'audio':
-                            audio_uuid = str(uuid.uuid4())
-                            print(f"[{self.get_timestamp()}] Novo áudio recebido do cliente final. UUID: {audio_uuid}")
-                            await self.send_audio_to_clients(base64.b64decode(data['audio_data']), audio_uuid)
-                    except json.JSONDecodeError:
-                        print(f"[{self.get_timestamp()}] Erro ao decodificar mensagem do cliente final")
-                    except Exception as e:
-                        print(f"[{self.get_timestamp()}] Erro ao processar mensagem do cliente final: {str(e)}")
-            else:
-                # Para clientes de processamento
-                async for message in websocket:
-                    await self.handle_message(message, client_ip)
-
-        except websockets.exceptions.ConnectionClosed:
-            print(f"[{self.get_timestamp()}] Cliente {client_ip} desconectou")
-            await self.client_manager.handle_client_disconnect(client_ip)
-        except Exception as e:
-            print(f"[{self.get_timestamp()}] Erro na conexão de {client_ip}: {e}")
-            await self.client_manager.handle_client_disconnect(client_ip)
+            except websockets.exceptions.ConnectionClosed:
+                print(f"[{self.get_timestamp()}] Cliente {client_ip} desconectou")
+                await self.client_manager.handle_client_disconnect(client_ip)
+            except Exception as e:
+                print(f"[{self.get_timestamp()}] Erro na conexão de {client_ip}: {e}")
+                await self.client_manager.handle_client_disconnect(client_ip)
 
     async def handle_message(self, message, client_info):
         """Processa mensagens recebidas dos clientes."""
@@ -174,69 +158,72 @@ class AudioServer:
             message_str = json.dumps(message)
             sent_successfully = False
 
-            # Adiciona verificação de clientes de processamento disponíveis
-            processing_clients = {ip: client for ip, client in self.client_manager.clients.items() 
-                                if client['type'] == 'processing'}
+            # Filtra apenas os clientes de processamento
+            processing_slots = {k: v for k, v in self.client_manager.processing_slots.items()}
 
-            if not processing_clients:
+            if not processing_slots:
                 print(f"[{self.get_timestamp()}] Não há clientes de processamento disponíveis para UUID {audio_uuid}")
                 return
 
             if self.client_manager.redundancy_level == 3:
                 next_client = self.client_manager.get_next_round_robin_client()
                 if next_client:
-                    client_info, client_data = next_client
-                    if await self.client_manager.send_to_client(client_info, message_str):
+                    slot_key, client_data = next_client
+                    if await self.client_manager.send_to_client(slot_key, message_str):
                         sent_successfully = True
                         print(f"[{self.get_timestamp()}] Áudio UUID {audio_uuid} enviado para cliente #{client_data['client_id']}")
                     else:
-                        await self.client_manager.handle_client_disconnect(client_info)
+                        await self.client_manager.handle_client_disconnect(client_data['ip'])
             
             elif self.client_manager.redundancy_level == 2:
-                for client_ip, client_data in processing_clients.items():
-                    if await self.client_manager.send_to_client(client_ip, message_str):
+                for slot_key, client_data in processing_slots.items():
+                    if await self.client_manager.send_to_client(slot_key, message_str):
                         sent_successfully = True
                         print(f"[{self.get_timestamp()}] Áudio UUID {audio_uuid} enviado para cliente #{client_data['client_id']}")
                     else:
-                        await self.client_manager.handle_client_disconnect(client_ip)
+                        await self.client_manager.handle_client_disconnect(client_data['ip'])
             
             elif self.client_manager.redundancy_level == 1:
                 if self.client_manager.selected_client:
-                    if await self.client_manager.send_to_client(self.client_manager.selected_client, message_str):
-                        client_data = self.client_manager.clients[self.client_manager.selected_client]
-                        sent_successfully = True
-                        print(f"[{self.get_timestamp()}] Áudio UUID {audio_uuid} enviado para cliente #{client_data['client_id']}")
-                    else:
-                        await self.client_manager.handle_client_disconnect(self.client_manager.selected_client)
+                    slot_key = self.client_manager.selected_client
+                    if slot_key in processing_slots:
+                        client_data = processing_slots[slot_key]
+                        if await self.client_manager.send_to_client(slot_key, message_str):
+                            sent_successfully = True
+                            print(f"[{self.get_timestamp()}] Áudio UUID {audio_uuid} enviado para cliente #{client_data['client_id']}")
+                        else:
+                            await self.client_manager.handle_client_disconnect(client_data['ip'])
 
             if not sent_successfully:
                 print(f"[{self.get_timestamp()}] Não foi possível enviar o áudio UUID {audio_uuid} para processamento")
 
     async def send_transcription_to_final_client(self, audio_uuid, transcription):
-        """Envia a transcrição de volta para o cliente final com o UUID."""
-        final_clients_found = False
-        for client_ip, client_data in self.client_manager.clients.items():
-            if client_data['type'] == 'final':
-                final_clients_found = True
-                message = {
-                    "type": "transcription",
-                    "timestamp": self.get_timestamp(),
-                    "text": transcription,
-                    "audio_uuid": audio_uuid
-                }
+            """Envia a transcrição de volta para o cliente final com o UUID."""
+            final_clients = {k: v for k, v in self.client_manager.clients.items() if '_final' in k}
+            
+            if not final_clients:
+                print(f"[{self.get_timestamp()}] Nenhum cliente final encontrado para receber a transcrição")
+                return
+
+            message = {
+                "type": "transcription",
+                "timestamp": self.get_timestamp(),
+                "text": transcription,
+                "audio_uuid": audio_uuid
+            }
+            message_str = json.dumps(message)
+
+            for client_key, client_data in final_clients.items():
                 try:
-                    success = await self.client_manager.send_to_client(client_ip, json.dumps(message))
+                    success = await self.client_manager.send_to_client(client_key, message_str)
                     if success:
-                        print(f"[{self.get_timestamp()}] Transcrição enviada para o cliente final")
+                        print(f"[{self.get_timestamp()}] Transcrição enviada para o cliente final #{client_data['client_id']}")
                         print(f"UUID: {audio_uuid}")
                         print(f"Texto: {transcription}")
                     else:
-                        print(f"[{self.get_timestamp()}] Falha ao enviar transcrição para o cliente final")
+                        print(f"[{self.get_timestamp()}] Falha ao enviar transcrição para o cliente final #{client_data['client_id']}")
                 except Exception as e:
-                    print(f"[{self.get_timestamp()}] Erro ao enviar transcrição para o cliente final: {e}")
-
-        if not final_clients_found:
-            print(f"[{self.get_timestamp()}] Nenhum cliente final encontrado para receber a transcrição")
+                    print(f"[{self.get_timestamp()}] Erro ao enviar para cliente final #{client_data['client_id']}: {e}")
 
     async def broadcast_audio(self):
         """Transmite áudio para os clientes."""
@@ -380,7 +367,7 @@ class AudioServer:
                         else:
                             self.audio_processor.reset_audio_state()
                         last_toggle_time = current_time
-                elif keyboard.is_pressed('m'):
+                elif keyboard.is_pressed('x'):
                     current_time = time.time()
                     if current_time - last_toggle_time > toggle_cooldown:
                         if not self.menu_active:
